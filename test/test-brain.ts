@@ -60,6 +60,7 @@ import {
   digestSession,
   harvestProposerPrompt,
   harvestRefuterPrompt,
+  normalizeSourceLine,
   planHarvestReview,
   scanSessions,
   trigramOverlap,
@@ -2317,6 +2318,30 @@ check("harvest validation: closed type set, required fields, the 1200-char body 
   assert.ok(/must cite its session in a source: line/.test(reasons), reasons);
   assert.deepEqual(validateHarvestProposals("not even an object").proposals, []);
   assert.equal(validateHarvestProposals({ nope: true }).invalid[0].reason, "output has no proposals array");
+});
+
+check("harvest validation: an INLINE session citation is moved onto its own line so the 0.85 cap detection sees it", () => {
+  // observed in the wild: the model ends the last sentence with the citation instead of a line break
+  const inline = "The owner keeps all Phonestack work in the cookbook workspace. source: session 2026-08-18, project diegoprozzi";
+  const fixed = normalizeSourceLine(inline);
+  assert.ok(fixed.endsWith("\n\nsource: session 2026-08-18, project diegoprozzi"), fixed);
+  assert.ok(isSourced(fixed), "the normalized body must pass the standard line-start source detection");
+  assert.ok(fixed.startsWith("The owner keeps all Phonestack work in the cookbook workspace."), "no words may change");
+  const already = "A fact.\n\nsource: session 2026-08-18, project x";
+  assert.equal(normalizeSourceLine(already), already, "a body already carrying a source line is untouched");
+  const none = "A fact with no citation of any kind.";
+  assert.equal(normalizeSourceLine(none), none, "nothing is invented for uncited bodies");
+  const { proposals, invalid } = validateHarvestProposals({
+    proposals: [
+      { type: "convention", title: "Inline citation", body: inline },
+      { type: "note", title: "Wrong type stays wrong", body: inline },
+      { type: "gotcha", title: "Still uncited", body: none },
+    ],
+  });
+  assert.equal(proposals.length, 1, JSON.stringify(invalid));
+  assert.ok(isSourced(proposals[0].body), "validated bodies must carry a line-start source line");
+  assert.equal(invalid.length, 2);
+  assert.ok(invalid.some((i) => i.reason.includes("must cite its session")), JSON.stringify(invalid));
 });
 
 check("harvest dedupe: title matches and >60% trigram overlap against ACTIVE notes are skipped with reasons", () => {

@@ -325,11 +325,29 @@ function asString(v: unknown): string | null {
 }
 
 /**
+ * Models often end the last sentence with an inline citation ("... in
+ * testing. source: session 2026-08-15, project x") instead of giving it its
+ * own line, and the standard source detection (and therefore the 0.85 cap)
+ * only sees line-start `source:` lines. This purely mechanical fix moves the
+ * LAST inline session citation onto its own line: it inserts a line break
+ * and changes no words. Bodies already carrying a line-start source line, or
+ * carrying no session citation at all, come back unchanged.
+ */
+export function normalizeSourceLine(body: string): string {
+  if (SOURCE_LINE_RE.test(body)) return body;
+  const matches = [...body.matchAll(/\bsource:\s*session\b/gi)];
+  if (matches.length === 0) return body;
+  const idx = matches[matches.length - 1].index;
+  return body.slice(0, idx).replace(/\s+$/, "") + "\n\n" + body.slice(idx);
+}
+
+/**
  * Deterministic validation of proposer output: unknown types (harvest may
  * only file decision, gotcha, convention, open_thread), missing titles or
  * bodies, bodies over the 1200 character cap, and bodies that fail to cite
  * their session in a `source:` line are all dropped here with a recorded
- * reason, before dedupe or the refuter ever see them.
+ * reason, before dedupe or the refuter ever see them. Inline citations are
+ * normalized onto their own line first (see normalizeSourceLine).
  */
 export function validateHarvestProposals(raw: unknown): { proposals: HarvestProposal[]; invalid: InvalidHarvestProposal[] } {
   const proposals: HarvestProposal[] = [];
@@ -348,11 +366,12 @@ export function validateHarvestProposals(raw: unknown): { proposals: HarvestProp
       drop("missing title");
       continue;
     }
-    const body = asString(p.body);
-    if (!body) {
+    const rawBody = asString(p.body);
+    if (!rawBody) {
       drop("missing body");
       continue;
     }
+    const body = normalizeSourceLine(rawBody);
     if (body.length > PROPOSAL_BODY_CHAR_CAP) {
       drop(`body is ${body.length} chars, over the ${PROPOSAL_BODY_CHAR_CAP} cap`);
       continue;
@@ -441,7 +460,7 @@ export function harvestProposerPrompt(digestText: string): string {
     "Rules:",
     '- Respond with ONLY a JSON object, no prose and no code fences: {"proposals": [{"type": ..., "title": ..., "body": ...}]}',
     `- One self-contained fact per note. Short stable title. Body of 2 to 6 sentences, under ${PROPOSAL_BODY_CHAR_CAP} characters.`,
-    "- Every body MUST end with a source line naming the session it came from, exactly like: source: session 2026-08-15, project cookbook-app",
+    "- Every body MUST end with a source line ON ITS OWN FINAL LINE naming the session it came from, exactly like: source: session 2026-08-15, project cookbook-app",
     "- Only distill what the digests actually say. Never invent details. Never propose tasks, edits, or merges of existing notes.",
     '- Propose nothing you are not confident about. {"proposals": []} is a good answer.',
     "- Do not use any tools. Answer from the digests alone.",
