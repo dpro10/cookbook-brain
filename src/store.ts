@@ -12,6 +12,7 @@
  */
 import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 export const NOTE_TYPES = ["decision", "gotcha", "convention", "note", "open_thread", "task"] as const;
@@ -35,6 +36,13 @@ export interface Note {
   supersedes: string | null;
   /** present only on notes that have been superseded */
   superseded_by?: string;
+  /**
+   * present only on notes written by a dream merge or promotion: the ids of
+   * the notes this one consolidated. Each consolidated note gets its
+   * superseded_by stamped to point here. supersedes stays single-valued for
+   * ordinary one-to-one edits.
+   */
+  consolidates?: string[];
   credits: number;
   last_credited: string | null;
   /** task notes only: open until claimed, claimed until done */
@@ -128,6 +136,18 @@ function parseScalar(raw: string): string | null {
   return s;
 }
 
+/** Parse a `[a, b, c]` frontmatter list. Returns null when the value is not bracketed. */
+function parseList(raw: string): string[] | null {
+  const s = raw.trim();
+  if (!s.startsWith("[") || !s.endsWith("]")) return null;
+  const inner = s.slice(1, -1).trim();
+  if (inner === "") return [];
+  return inner
+    .split(",")
+    .map((part) => parseScalar(part) ?? "")
+    .filter((v) => v !== "");
+}
+
 export function serializeNote(note: Omit<Note, "file">): string {
   const lines = [
     "---",
@@ -140,6 +160,7 @@ export function serializeNote(note: Omit<Note, "file">): string {
     `created: ${note.created}`,
     `supersedes: ${fmScalar(note.supersedes)}`,
   ];
+  if (note.consolidates !== undefined) lines.push(`consolidates: [${note.consolidates.map(fmScalar).join(", ")}]`);
   if (note.superseded_by !== undefined) lines.push(`superseded_by: ${fmScalar(note.superseded_by)}`);
   lines.push(`credits: ${note.credits}`);
   lines.push(`last_credited: ${fmScalar(note.last_credited)}`);
@@ -211,6 +232,17 @@ export function parseNoteFile(file: string, content: string): ParsedFile {
   const supersedes = fields.has("supersedes") ? get("supersedes") : undefined;
   if (supersedes === undefined) problems.push("missing supersedes (use null for original notes)");
   const supersededBy = fields.has("superseded_by") ? get("superseded_by") : undefined;
+  let consolidates: string[] | undefined;
+  if (fields.has("consolidates")) {
+    const list = parseList(fields.get("consolidates")!);
+    if (list === null) {
+      problems.push(`consolidates is not a [bracketed] list of note ids: ${fields.get("consolidates")!.trim()}`);
+    } else if (list.length === 0) {
+      problems.push("consolidates must list at least one note id");
+    } else {
+      consolidates = list;
+    }
+  }
   const creditsRaw = get("credits");
   const credits = creditsRaw === null || creditsRaw === undefined ? NaN : Number(creditsRaw);
   if (!Number.isInteger(credits) || credits < 0) {
@@ -260,6 +292,7 @@ export function parseNoteFile(file: string, content: string): ParsedFile {
     file,
   };
   if (supersededBy != null) note.superseded_by = supersededBy;
+  if (consolidates !== undefined) note.consolidates = consolidates;
   if (type === "task") {
     note.status = status;
     note.assigned_to = assignedTo ?? null;
@@ -334,6 +367,8 @@ export interface CreateInput {
   body: string;
   author: Author;
   supersedes?: string | null;
+  /** dream merge/promote notes only: ids of the notes being consolidated */
+  consolidates?: string[];
   created?: string;
   id?: string;
   /** task notes only */
@@ -358,6 +393,10 @@ export function createNote(dir: string, input: CreateInput): Note {
     last_credited: null,
     body: input.body.trim(),
   };
+  if (input.consolidates !== undefined) {
+    if (input.consolidates.length === 0) throw new Error("consolidates must list at least one note id");
+    note.consolidates = [...input.consolidates];
+  }
   if (input.type === "task") {
     note.status = "open";
     note.assigned_to = input.assigned_to?.trim() || null;
@@ -404,6 +443,36 @@ export function supersedeNote(
   const newNote = createNote(dir, { ...input, supersedes: oldId });
   const stamped = stampNote({ ...oldNote, superseded_by: newNote.id });
   return { oldNote: stamped, newNote };
+}
+
+/**
+ * Consolidate: write one new note whose `consolidates` field lists the source
+ * ids, then stamp `superseded_by` on every source pointing at the new note.
+ * This is how dream merges and promotions stay reversible: the sources keep
+ * their bodies forever, and the only mutation is the sanctioned
+ * superseded_by stamp. All sources are validated before anything is written,
+ * so a bad id consolidates nothing.
+ */
+export function consolidateNotes(
+  dir: string,
+  sourceIds: string[],
+  input: Omit<CreateInput, "supersedes" | "consolidates">,
+): { sources: Note[]; newNote: Note } {
+  if (sourceIds.length === 0) throw new Error("consolidate requires at least one source note id");
+  if (new Set(sourceIds).size !== sourceIds.length) throw new Error("consolidate source ids must be distinct");
+  const brain = loadBrain(dir);
+  const sources: Note[] = [];
+  for (const id of sourceIds) {
+    const note = brain.byId.get(id);
+    if (!note) throw new Error(`no note with id ${id} in ${dir} (nothing was consolidated)`);
+    if (note.superseded_by !== undefined) {
+      throw new Error(`note ${id} is already superseded by ${note.superseded_by} (nothing was consolidated)`);
+    }
+    sources.push(note);
+  }
+  const newNote = createNote(dir, { ...input, consolidates: [...sourceIds] });
+  const stamped = sources.map((n) => stampNote({ ...n, superseded_by: newNote.id }));
+  return { sources: stamped, newNote };
 }
 
 // ---- crediting ----
@@ -710,24 +779,35 @@ export function searchRanked(brain: Brain, query: string, now: number = Date.now
 // ---- doctor ----
 
 /**
+ * Groups of ACTIVE notes sharing a title (case-insensitive), each group in id
+ * order. These make wikilinks ambiguous; doctor reports them and dream's
+ * hygiene pass seeds retitle/merge proposals from them.
+ */
+export function duplicateActiveTitleGroups(brain: Brain): Note[][] {
+  const groups = new Map<string, Note[]>();
+  for (const n of activeNotes(brain)) {
+    const key = n.title.toLowerCase();
+    const list = groups.get(key) ?? [];
+    list.push(n);
+    groups.set(key, list);
+  }
+  return [...groups.values()].filter((g) => g.length > 1);
+}
+
+/**
  * Full validation pass: parse problems, broken wikilinks, dangling or
- * inconsistent supersedes chains, task lifecycle consistency, and duplicate
- * active titles (which make wikilinks ambiguous).
+ * inconsistent supersedes/consolidates chains, task lifecycle consistency,
+ * and duplicate active titles (which make wikilinks ambiguous).
  */
 export function diagnose(dir: string): BrainProblem[] {
   const brain = loadBrain(dir);
   const problems = [...brain.problems];
-  const seenActiveTitles = new Map<string, Note>();
-  for (const n of activeNotes(brain)) {
-    const key = n.title.toLowerCase();
-    const prior = seenActiveTitles.get(key);
-    if (prior) {
+  for (const group of duplicateActiveTitleGroups(brain)) {
+    for (const n of group.slice(1)) {
       problems.push({
         file: n.file,
-        message: `duplicate title "${n.title}" (also active in ${path.basename(prior.file)}); wikilinks to it are ambiguous, consider supersede`,
+        message: `duplicate title "${n.title}" (also active in ${path.basename(group[0].file)}); wikilinks to it are ambiguous, consider supersede`,
       });
-    } else {
-      seenActiveTitles.set(key, n);
     }
   }
   for (const n of brain.notes) {
@@ -755,17 +835,46 @@ export function diagnose(dir: string): BrainProblem[] {
         });
       }
     }
+    if (n.consolidates !== undefined) {
+      for (const cid of n.consolidates) {
+        const source = brain.byId.get(cid);
+        if (!source) {
+          problems.push({ file: n.file, message: `dangling consolidates: ${cid} does not exist` });
+        } else if (source.superseded_by !== n.id) {
+          problems.push({
+            file: n.file,
+            message: `consolidates chain mismatch: this note consolidates ${cid}, but that note's superseded_by is ${source.superseded_by ?? "not set"}`,
+          });
+        }
+      }
+    }
     if (n.superseded_by !== undefined) {
       const successor = brain.byId.get(n.superseded_by);
       if (!successor) {
         problems.push({ file: n.file, message: `dangling superseded_by: ${n.superseded_by} does not exist` });
-      } else if (successor.supersedes !== n.id) {
+      } else if (successor.supersedes !== n.id && !(successor.consolidates?.includes(n.id) ?? false)) {
         problems.push({
           file: n.file,
-          message: `supersedes chain mismatch: superseded_by ${n.superseded_by}, but that note supersedes ${successor.supersedes ?? "nothing"}`,
+          message: `supersedes chain mismatch: superseded_by ${n.superseded_by}, but that note neither supersedes nor consolidates this one (it supersedes ${successor.supersedes ?? "nothing"})`,
         });
       }
     }
   }
   return problems;
+}
+
+// ---- attribution ----
+
+/**
+ * The brain owner's name for attribution: the BRAIN_HUMAN environment
+ * variable, falling back to the OS username.
+ */
+export function humanName(env: NodeJS.ProcessEnv = process.env): string {
+  const fromEnv = env.BRAIN_HUMAN?.trim();
+  if (fromEnv) return fromEnv;
+  try {
+    return os.userInfo().username;
+  } catch {
+    return "unknown";
+  }
 }
