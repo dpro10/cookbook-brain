@@ -9,6 +9,8 @@
  *   tasks    list open and claimed tasks with their age
  *   doctor   validate every note and the link/supersede graph
  *   dream    offline consolidation: propose, refute, and (with --apply) apply
+ *   harvest  bootstrap memory from local Claude Code transcripts: digest,
+ *            propose, refute, and (with --apply) write new notes
  *
  * The brain directory resolves as: --dir flag, then the BRAIN_DIR environment
  * variable, then ./brain.
@@ -42,16 +44,22 @@ Commands:
   dream           consolidate overnight: merge duplicates, promote proven
                   gotchas, flag contradictions; an adversarial refuter reviews
                   every proposal; report-only unless --apply
+  harvest         bootstrap memory from your local Claude Code sessions:
+                  digest recent transcripts, propose atomic notes, and have an
+                  adversarial refuter review them; report-only unless --apply
 
 Options:
   --dir <path>   brain directory (default ./brain; BRAIN_DIR env also works)
-  --apply        dream: execute proposals the refuter kept (default: report-only)
+  --apply        dream/harvest: execute proposals the refuter kept (default: report-only)
   --commit       dream: after a successful apply, git commit the brain directory
                  (only paths under it); requires --apply and a git repo
-  --json         dream: print a machine-readable JSON report to stdout
+  --json         dream/harvest: print a machine-readable JSON report to stdout
                  (the markdown report file is still written)
-  --model <id>   dream: model id passed to claude -p --model (default: your claude setting)
-  --dry-digest   dream: print exactly what would be sent to the model, then exit
+  --model <id>   dream/harvest: model id passed to claude -p --model (default: your claude setting)
+  --dry-digest   dream/harvest: print exactly what would be sent to the model, then exit
+  --sessions <path>  harvest: transcripts root (default ~/.claude/projects)
+  --days <n>     harvest: how many days of sessions to scan (default 7)
+  --project <name>   harvest: only sessions whose working directory basename matches
   --help         show this help
 
 Hook it up to Claude Code:
@@ -183,6 +191,21 @@ which the note scanner never reads. While a dream applies its changes it
 holds a \`.lock\` file in this directory; write tools wait it out, reads
 never block, and a lock older than ten minutes is stale and ignored.
 
+## Harvest
+
+\`cookbook-brain harvest\` bootstraps and tops up the brain from your local
+Claude Code session transcripts: it digests recent sessions, proposes NEW
+atomic notes from a closed set (decision, gotcha, convention, open_thread),
+and the same adversarial-refuter contract as dreaming applies: every
+proposal is reviewed, unreviewed proposals are never applied, and nothing
+is applied without \`--apply\`. Notes a harvest writes are authored
+\`{ human: <brain owner>, agent: "harvest" }\`, and each body ends with a
+\`source:\` line citing the session it was distilled from, so the
+sourced-agent confidence cap (0.85) applies through the ordinary source
+detection. The brain trusts its own bootstrap more than a bare claim, but
+less than you. Harvest reports live in the \`dreams/\` subdirectory as
+\`HARVEST_<date>.md\`.
+
 ## Git
 
 Commit this directory. It is designed to be versioned with the project it
@@ -196,12 +219,16 @@ interface Args {
   rest: string[];
   dir: string;
   limit: number;
-  /** dream only */
+  /** dream + harvest */
   apply: boolean;
   commit: boolean;
   json: boolean;
   model?: string;
   dryDigest: boolean;
+  /** harvest only */
+  sessions?: string;
+  days: number;
+  project?: string;
 }
 
 function fail(msg: string): never {
@@ -211,7 +238,7 @@ function fail(msg: string): never {
 }
 
 function parseArgs(argv: string[]): Args {
-  const args: Args = { command: null, rest: [], dir: "", limit: 20, apply: false, commit: false, json: false, dryDigest: false };
+  const args: Args = { command: null, rest: [], dir: "", limit: 20, apply: false, commit: false, json: false, dryDigest: false, days: 7 };
   let dirFlag: string | undefined;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -236,6 +263,16 @@ function parseArgs(argv: string[]): Args {
     } else if (a === "--model") {
       args.model = argv[++i];
       if (!args.model) fail("--model requires a model id");
+    } else if (a === "--sessions") {
+      args.sessions = argv[++i];
+      if (!args.sessions) fail("--sessions requires a path");
+    } else if (a === "--days") {
+      const n = Number(argv[++i]);
+      if (!Number.isInteger(n) || n < 1) fail("--days requires a positive integer");
+      args.days = n;
+    } else if (a === "--project") {
+      args.project = argv[++i];
+      if (!args.project) fail("--project requires a name");
     } else if (a.startsWith("--")) {
       fail(`unknown option: ${a}`);
     } else if (args.command === null) {
@@ -469,6 +506,96 @@ async function cmdDream(args: Args): Promise<void> {
   console.log(`report: ${outcome.reportFile}`);
 }
 
+async function cmdHarvest(args: Args): Promise<void> {
+  if (!fs.existsSync(args.dir)) fail(`no brain directory at ${args.dir} (run: cookbook-brain init)`);
+  const { DEFAULT_SESSIONS_ROOT, buildHarvestDigest, harvest, harvestProposerPrompt, scanSessions } = await import("./harvest.ts");
+  const { findClaudeBinary } = await import("./dream.ts");
+  const sessionsRoot = args.sessions ? path.resolve(args.sessions) : DEFAULT_SESSIONS_ROOT;
+
+  if (args.dryDigest) {
+    // Trust feature: print exactly what would leave for the proposer model, make no calls.
+    const scanned = scanSessions(sessionsRoot, { days: args.days, project: args.project });
+    process.stdout.write(harvestProposerPrompt(buildHarvestDigest(scanned).text));
+    return;
+  }
+
+  if (!findClaudeBinary()) {
+    console.error(
+      [
+        "[cookbook-brain] harvest needs the Claude Code CLI: no `claude` binary was found on your PATH.",
+        "Harvest reads your local session transcripts and sends compact digests to your own logged-in `claude`",
+        "(install it from https://claude.com/claude-code, then run `claude` once to log in).",
+        "cookbook-brain never reads or requires API keys, so there is nothing else to configure.",
+      ].join("\n"),
+    );
+    process.exit(2);
+  }
+
+  const outcome = harvest({
+    dir: args.dir,
+    sessionsRoot,
+    days: args.days,
+    project: args.project,
+    apply: args.apply,
+    model: args.model,
+    human: humanName(),
+  });
+  const appliedOk = outcome.applied.filter((a) => a.ok).length;
+
+  if (args.json) {
+    // machine-readable report on stdout, and nothing else
+    process.stdout.write(
+      JSON.stringify(
+        {
+          date: new Date().toISOString(),
+          brain: args.dir,
+          sessions_root: sessionsRoot,
+          days: args.days,
+          project: args.project ?? null,
+          mode: args.apply ? "apply" : "report-only",
+          sessions_scanned: outcome.sessionsScanned,
+          sessions_digested: outcome.sessionsDigested,
+          dropped_for_budget: outcome.droppedForBudget,
+          proposals: outcome.proposals,
+          invalid: outcome.invalid,
+          deduped: outcome.deduped,
+          refuter_ran: outcome.refuterRan,
+          verdicts: outcome.verdicts,
+          skipped_review: outcome.skippedReview,
+          kept: outcome.keptCount,
+          applied: outcome.applied,
+          lock_note: outcome.lockNote,
+          report_file: outcome.reportFile,
+        },
+        null,
+        2,
+      ) + "\n",
+    );
+    return;
+  }
+
+  console.log(
+    `cookbook-brain harvest: ${outcome.sessionsScanned} session(s) in the last ${args.days} day(s), ${outcome.sessionsDigested} digested` +
+      (outcome.droppedForBudget.length > 0 ? `, ${outcome.droppedForBudget.length} dropped for the digest budget` : ""),
+  );
+  console.log(
+    `proposals: ${outcome.proposals.length} (${outcome.keptCount} kept)  deduped: ${outcome.deduped.length}  refuter: ${outcome.refuterRan ? "ran" : "absent"}`,
+  );
+  if (outcome.skippedReview.length > 0) {
+    console.log(`not reviewed (too large for the refuter prompt cap): proposal ${outcome.skippedReview.join(", proposal ")}`);
+  }
+  if (outcome.lockNote) console.log(`lock: ${outcome.lockNote}`);
+  if (!args.apply) {
+    console.log("applied: nothing (report-only run; re-run with --apply to write the kept notes)");
+  } else if (!outcome.refuterRan) {
+    console.log("applied: nothing (the refuter was absent, and unreviewed harvests are never applied)");
+  } else {
+    console.log(`applied: ${appliedOk} note(s)`);
+    for (const a of outcome.applied) console.log(`  ${a.ok ? "ok " : "FAIL"} ${a.description}`);
+  }
+  console.log(`report: ${outcome.reportFile}`);
+}
+
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   switch (args.command) {
@@ -494,6 +621,9 @@ async function main(): Promise<void> {
       break;
     case "dream":
       await cmdDream(args);
+      break;
+    case "harvest":
+      await cmdHarvest(args);
       break;
     case null:
       fail("no command given");
