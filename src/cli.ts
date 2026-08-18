@@ -8,6 +8,7 @@
  *   credit   credit notes that proved true in completed work
  *   tasks    list open and claimed tasks with their age
  *   doctor   validate every note and the link/supersede graph
+ *   dream    offline consolidation: propose, refute, and (with --apply) apply
  *
  * The brain directory resolves as: --dir flag, then the BRAIN_DIR environment
  * variable, then ./brain.
@@ -19,6 +20,7 @@ import {
   confidenceFor,
   creditNotes,
   diagnose,
+  humanName,
   listTasks,
   loadBrain,
   tierFor,
@@ -36,9 +38,15 @@ Commands:
   credit <id...>  credit notes whose facts held up in completed work
   tasks           list open and claimed tasks with their age
   doctor          validate every note, wikilink, supersedes chain, and task
+  dream           consolidate overnight: merge duplicates, promote proven
+                  gotchas, flag contradictions; an adversarial refuter reviews
+                  every proposal; report-only unless --apply
 
 Options:
   --dir <path>   brain directory (default ./brain; BRAIN_DIR env also works)
+  --apply        dream: execute proposals the refuter kept (default: report-only)
+  --model <id>   dream: model id passed to claude -p --model (default: your claude setting)
+  --dry-digest   dream: print exactly what would be sent to the model, then exit
   --help         show this help
 
 Hook it up to Claude Code:
@@ -88,6 +96,10 @@ The fields:
   themselves.
 - **created**: ISO timestamp.
 - **supersedes**: the id of the note this one replaces, or \`null\`.
+- **consolidates**: merge and promotion notes written by \`dream\` only: the
+  ids of the notes this one consolidated, as a \`[bracketed, list]\`. Each
+  consolidated note has its \`superseded_by\` stamped to point at this note.
+  \`supersedes\` stays single-valued and is for ordinary one-to-one edits.
 - **credits**: how many times this note rode into work that verifiably
   completed. Crediting raises recall confidence toward the note's cap.
 - **last_credited**: when that last happened, or \`null\`.
@@ -147,6 +159,17 @@ ever changes a body.
 
 Superseded notes are excluded from recall by default.
 
+## Dreams
+
+\`cookbook-brain dream\` is an offline consolidation pass: it proposes
+merges, promotions of proven gotchas to conventions, contradiction flags,
+and retitles, and an adversarial refuter reviews every proposal before
+anything is applied (and nothing is applied without \`--apply\`). Notes a
+dream writes are authored \`{ human: <brain owner>, agent: "dream" }\`, so
+the bare-agent provenance cap applies: the brain distrusts its own dreams
+until work proves them. Dream reports live in the \`dreams/\` subdirectory,
+which the note scanner never reads.
+
 ## Git
 
 Commit this directory. It is designed to be versioned with the project it
@@ -160,6 +183,10 @@ interface Args {
   rest: string[];
   dir: string;
   limit: number;
+  /** dream only */
+  apply: boolean;
+  model?: string;
+  dryDigest: boolean;
 }
 
 function fail(msg: string): never {
@@ -169,7 +196,7 @@ function fail(msg: string): never {
 }
 
 function parseArgs(argv: string[]): Args {
-  const args: Args = { command: null, rest: [], dir: "", limit: 20 };
+  const args: Args = { command: null, rest: [], dir: "", limit: 20, apply: false, dryDigest: false };
   let dirFlag: string | undefined;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -183,6 +210,13 @@ function parseArgs(argv: string[]): Args {
       const n = Number(argv[++i]);
       if (!Number.isInteger(n) || n < 1) fail("--limit requires a positive integer");
       args.limit = n;
+    } else if (a === "--apply") {
+      args.apply = true;
+    } else if (a === "--dry-digest") {
+      args.dryDigest = true;
+    } else if (a === "--model") {
+      args.model = argv[++i];
+      if (!args.model) fail("--model requires a model id");
     } else if (a.startsWith("--")) {
       fail(`unknown option: ${a}`);
     } else if (args.command === null) {
@@ -302,6 +336,45 @@ function cmdDoctor(dir: string): void {
   process.exit(1);
 }
 
+async function cmdDream(args: Args): Promise<void> {
+  if (!fs.existsSync(args.dir)) fail(`no brain directory at ${args.dir} (run: cookbook-brain init)`);
+  const { buildDigest, dream, findClaudeBinary, hygieneFindings, proposerPrompt } = await import("./dream.ts");
+
+  if (args.dryDigest) {
+    // Trust feature: print exactly what would leave for the proposer model, make no calls.
+    const brain = loadBrain(args.dir);
+    const now = Date.now();
+    process.stdout.write(proposerPrompt(buildDigest(brain, now).text, hygieneFindings(brain, now)));
+    return;
+  }
+
+  if (!findClaudeBinary()) {
+    console.error(
+      [
+        "[cookbook-brain] dream needs the Claude Code CLI: no `claude` binary was found on your PATH.",
+        "Dreaming runs on your own logged-in `claude` (install it from https://claude.com/claude-code, then run `claude` once to log in).",
+        "cookbook-brain never reads or requires API keys, so there is nothing else to configure.",
+      ].join("\n"),
+    );
+    process.exit(2);
+  }
+
+  const outcome = dream({ dir: args.dir, apply: args.apply, model: args.model, human: humanName() });
+  console.log(`cookbook-brain dream: ${outcome.activeCount} active note(s) digested, ${outcome.hygieneTotal} hygiene finding(s)`);
+  console.log(
+    `proposals: ${outcome.proposals.length} (${outcome.keptCount} kept)  refuter: ${outcome.refuterRan ? "ran" : "absent"}`,
+  );
+  if (!args.apply) {
+    console.log("applied: nothing (report-only run; re-run with --apply to execute kept proposals)");
+  } else if (!outcome.refuterRan) {
+    console.log("applied: nothing (the refuter was absent, and unreviewed dreams are never applied)");
+  } else {
+    console.log(`applied: ${outcome.applied.filter((a) => a.ok).length} change(s)`);
+    for (const a of outcome.applied) console.log(`  ${a.ok ? "ok " : "FAIL"} ${a.description}`);
+  }
+  console.log(`report: ${outcome.reportFile}`);
+}
+
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   switch (args.command) {
@@ -324,6 +397,9 @@ async function main(): Promise<void> {
       break;
     case "doctor":
       cmdDoctor(args.dir);
+      break;
+    case "dream":
+      await cmdDream(args);
       break;
     case null:
       fail("no command given");
