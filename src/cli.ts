@@ -598,7 +598,7 @@ async function cmdHarvest(args: Args): Promise<void> {
   if (args.dryDigest) {
     // Trust feature: print exactly what would leave for the proposer model, make no calls.
     const scanned = scanSessions(sessionsRoot, { days: args.days, project: args.project });
-    process.stdout.write(harvestProposerPrompt(buildHarvestDigest(scanned).text));
+    process.stdout.write(harvestProposerPrompt(buildHarvestDigest(scanned.sessions).text));
     return;
   }
 
@@ -637,6 +637,8 @@ async function cmdHarvest(args: Args): Promise<void> {
           project: args.project ?? null,
           mode: args.apply ? "apply" : "report-only",
           sessions_scanned: outcome.sessionsScanned,
+          internal_runs_skipped: outcome.internalRuns,
+          no_in_window: outcome.noInWindow,
           sessions_digested: outcome.sessionsDigested,
           dropped_for_budget: outcome.droppedForBudget,
           proposals: outcome.proposals,
@@ -659,6 +661,7 @@ async function cmdHarvest(args: Args): Promise<void> {
 
   console.log(
     `cookbook-brain harvest: ${outcome.sessionsScanned} session(s) in the last ${args.days} day(s), ${outcome.sessionsDigested} digested` +
+      (outcome.internalRuns > 0 ? `, ${outcome.internalRuns} internal tool run(s) skipped` : "") +
       (outcome.droppedForBudget.length > 0 ? `, ${outcome.droppedForBudget.length} dropped for the digest budget` : ""),
   );
   console.log(

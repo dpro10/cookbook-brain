@@ -5,10 +5,17 @@
  * A harvest runs in five passes:
  *
  *   1. Scan (deterministic, no model): read ~/.claude/projects transcripts
- *      from the last N days and build one compact digest per session out of
- *      the human's substantive messages and the assistant's main conclusions.
- *      Tool traffic is skipped. When the combined digests exceed the budget,
- *      the OLDEST sessions are dropped first, and the report records them.
+ *      and build one compact digest per session out of the human's
+ *      substantive messages and the assistant's main conclusions FROM THE
+ *      LAST N DAYS, windowed by each message's own timestamp: a months-old
+ *      session touched yesterday contributes only its in-window slice, never
+ *      its whole history. File mtime is only a cheap pre-filter to skip
+ *      files that cannot contain in-window messages, never a reason to
+ *      include content. Transcripts of this tool's own `claude -p` calls
+ *      (harvest and dream runs) are detected by their prompt marker and
+ *      skipped. Tool traffic is skipped. When the combined digests exceed
+ *      the budget, the OLDEST sessions are dropped first, and the report
+ *      records them.
  *   2. Proposer: one `claude -p` call over the digests proposes NEW atomic
  *      notes from a closed set only: decision, gotcha, convention,
  *      open_thread. No tasks, no merges, no edits of existing notes. Every
@@ -56,7 +63,7 @@ import {
   type Brain,
   type NoteType,
 } from "./store.ts";
-import { extractJson, parseVerdicts, runClaude, type AppliedChange, type Verdict } from "./dream.ts";
+import { INTERNAL_RUN_MARKER, extractJson, parseVerdicts, runClaude, type AppliedChange, type Verdict } from "./dream.ts";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -108,10 +115,18 @@ export interface ScannedSession {
   sessionId: string;
   /** the session's working directory basename (or the encoded project dir's last segment) */
   project: string;
-  /** YYYY-MM-DD of the session's last activity, used in source citations */
+  /** YYYY-MM-DD of the FIRST in-window message in the digested slice */
+  startDate: string;
+  /** YYYY-MM-DD of the LAST in-window message in the digested slice, used in source citations */
   date: string;
   end: string;
+  /** the in-window substantive messages only; older history in the same file never reaches a digest */
   items: SessionItem[];
+}
+
+/** The citable date form of a digested slice: a single day stays bare, a span reads "start to end". */
+export function sessionDateRange(s: Pick<ScannedSession, "startDate" | "date">): string {
+  return s.startDate === s.date ? s.date : `${s.startDate} to ${s.date}`;
 }
 
 export interface ScanOptions {
@@ -119,6 +134,34 @@ export interface ScanOptions {
   days: number;
   /** case-insensitive exact match on the session's cwd basename */
   project?: string;
+}
+
+export interface ScanResult {
+  sessions: ScannedSession[];
+  /** transcripts skipped because they are this tool's own `claude -p` runs (harvest/dream proposer and refuter calls) */
+  internalRuns: number;
+  /** sessions whose file passed the mtime pre-filter but whose substantive messages all fall outside the window */
+  noInWindow: number;
+}
+
+/**
+ * First-user-message prefixes that identify a transcript as one of this
+ * tool's own print-mode calls. New runs carry the exact INTERNAL_RUN_MARKER
+ * as the prompt's first line; the prompt preambles cover transcripts written
+ * before the marker existed.
+ */
+const INTERNAL_RUN_PREFIXES = [
+  INTERNAL_RUN_MARKER,
+  "You are the HARVESTER in a memory bootstrap pass",
+  "You are the REFUTER reviewing memory notes proposed from digests",
+  "You are the PROPOSER in a memory consolidation pass",
+  "You are the REFUTER reviewing consolidation proposals",
+];
+
+/** True when a session's first user message is one of this tool's own prompts, so the session is the tool talking to itself. */
+export function isInternalRunPrompt(text: string): boolean {
+  const t = text.trimStart();
+  return INTERNAL_RUN_PREFIXES.some((p) => t.startsWith(p));
 }
 
 /** The encoded project folder name embeds the full path; reduce to a basename (same trick as cookbook-meter). */
@@ -149,22 +192,38 @@ function isHumanNoise(text: string): boolean {
 }
 
 /**
- * Scan a transcripts root for sessions from the last N days. Only top-level
- * <sessionId>.jsonl files are read: nested subagent transcripts are skipped
- * on purpose (their "user" messages are agent-written prompts, not the
- * human's words). Unreadable files and malformed lines are skipped, never
- * fatal. Returns sessions in chronological order, oldest first.
+ * Scan a transcripts root for session activity from the last N days. Only
+ * top-level <sessionId>.jsonl files are read: nested subagent transcripts
+ * are skipped on purpose (their "user" messages are agent-written prompts,
+ * not the human's words). Unreadable files and malformed lines are skipped,
+ * never fatal.
+ *
+ * The window is applied PER MESSAGE, by each entry's own timestamp: a
+ * long-lived session file contributes only its in-window messages, so old
+ * history in a recently touched file never leaks into a digest, and never
+ * gets attributed to today. File mtime is used only as a cheap pre-filter
+ * to SKIP files whose mtime predates the window start (a transcript's mtime
+ * is >= its last line's timestamp, so those cannot contain in-window
+ * messages); it is never a reason to include content. A message with no
+ * usable timestamp is excluded rather than guessed into the window.
+ *
+ * Transcripts of this tool's own `claude -p` calls (their first user message
+ * is one of our prompts; see isInternalRunPrompt) are skipped and counted.
+ * Returns sessions in chronological order of last in-window activity,
+ * oldest first.
  */
-export function scanSessions(root: string, opts: ScanOptions): ScannedSession[] {
+export function scanSessions(root: string, opts: ScanOptions): ScanResult {
   const now = opts.now ?? Date.now();
   const cutoffIso = new Date(now - opts.days * DAY_MS).toISOString();
   const filter = opts.project?.trim().toLowerCase();
   const out: ScannedSession[] = [];
+  let internalRuns = 0;
+  let noInWindow = 0;
   let projectDirs: fs.Dirent[];
   try {
     projectDirs = fs.readdirSync(root, { withFileTypes: true });
   } catch {
-    return [];
+    return { sessions: [], internalRuns, noInWindow };
   }
   for (const pd of projectDirs) {
     if (!pd.isDirectory()) continue;
@@ -179,7 +238,7 @@ export function scanSessions(root: string, opts: ScanOptions): ScannedSession[] 
       if (!e.isFile() || !e.name.endsWith(".jsonl")) continue; // directories (subagents/ etc.) deliberately skipped
       const file = path.join(dir, e.name);
       try {
-        // a transcript's mtime is >= its last line's timestamp, so older files cannot be in-window
+        // pre-filter ONLY: a transcript's mtime is >= its last line's timestamp, so older files cannot contain in-window messages
         if (fs.statSync(file).mtimeMs < now - opts.days * DAY_MS) continue;
       } catch {
         continue;
@@ -191,7 +250,12 @@ export function scanSessions(root: string, opts: ScanOptions): ScannedSession[] 
         continue;
       }
       let cwd: string | null = null;
+      let lastTs: string | null = null;
+      let start: string | null = null;
       let end: string | null = null;
+      let firstUserSeen = false;
+      let internal = false;
+      let droppedOutOfWindow = 0;
       const items: SessionItem[] = [];
       for (const line of raw.split("\n")) {
         if (!line.trim()) continue;
@@ -201,31 +265,56 @@ export function scanSessions(root: string, opts: ScanOptions): ScannedSession[] 
         } catch {
           continue; // partial write
         }
+        if (typeof o.timestamp === "string") lastTs = o.timestamp;
         const type = o.type;
         if (type !== "user" && type !== "assistant") continue;
-        const ts = typeof o.timestamp === "string" ? o.timestamp : null;
-        if (ts && (!end || ts > end)) end = ts;
         if (!cwd && typeof o.cwd === "string" && o.cwd) cwd = o.cwd;
         const message = o.message as { content?: unknown } | undefined;
         const text = textOf(message?.content).trim();
+        if (type === "user" && !o.isMeta && text !== "" && !firstUserSeen) {
+          firstUserSeen = true;
+          if (isInternalRunPrompt(text)) {
+            internal = true;
+            break; // the whole session is the tool talking to itself
+          }
+        }
         if (type === "user") {
           if (o.isMeta) continue;
           if (isHumanNoise(text)) continue;
-          items.push({ role: "human", text });
         } else {
           if (text.length < AGENT_CONCLUSION_MIN_CHARS) continue;
-          items.push({ role: "agent", text });
         }
+        // window by the message's own timestamp (carrying the last seen one forward for entries that lack their own)
+        if (!lastTs || lastTs < cutoffIso) {
+          droppedOutOfWindow++;
+          continue;
+        }
+        if (!start || lastTs < start) start = lastTs;
+        if (!end || lastTs > end) end = lastTs;
+        items.push({ role: type === "user" ? "human" : "agent", text });
       }
-      if (!end || end < cutoffIso) continue;
-      if (items.length === 0) continue;
       const project = cwd ? path.basename(cwd) : encodedBasename(pd.name);
       if (filter && project.toLowerCase() !== filter) continue;
-      out.push({ sessionId: path.basename(e.name, ".jsonl"), project, date: end.slice(0, 10), end, items });
+      if (internal) {
+        internalRuns++;
+        continue;
+      }
+      if (items.length === 0) {
+        if (droppedOutOfWindow > 0) noInWindow++;
+        continue;
+      }
+      out.push({
+        sessionId: path.basename(e.name, ".jsonl"),
+        project,
+        startDate: start!.slice(0, 10),
+        date: end!.slice(0, 10),
+        end: end!,
+        items,
+      });
     }
   }
   out.sort((a, b) => (a.end < b.end ? -1 : a.end > b.end ? 1 : 0));
-  return out;
+  return { sessions: out, internalRuns, noInWindow };
 }
 
 // ---- digests ----
@@ -233,7 +322,12 @@ export function scanSessions(root: string, opts: ScanOptions): ScannedSession[] 
 export interface SessionDigestInfo {
   sessionId: string;
   project: string;
+  /** YYYY-MM-DD of the first in-window message in the digested slice */
+  startDate: string;
+  /** YYYY-MM-DD of the last in-window message in the digested slice */
   date: string;
+  /** in-window substantive message count (the slice the digest was built from) */
+  messages: number;
   chars: number;
 }
 
@@ -243,16 +337,17 @@ function flatten(text: string, cap: number): string {
 }
 
 /**
- * One session's digest block: a citable header, then the human's substantive
- * messages (up to 12) and the assistant's key conclusions (the last 4 long
- * texts), in conversation order, capped per session so one marathon session
- * cannot crowd out the rest.
+ * One session's digest block: a citable header carrying the actual message-
+ * date range of the in-window slice, then the human's substantive messages
+ * (up to 12) and the assistant's key conclusions (the last 4 long texts), in
+ * conversation order, capped per session so one marathon session cannot
+ * crowd out the rest.
  */
 export function digestSession(s: ScannedSession): string {
   const humans = s.items.filter((i) => i.role === "human").slice(0, MAX_HUMAN_MSGS);
   const agents = s.items.filter((i) => i.role === "agent").slice(-MAX_AGENT_CONCLUSIONS);
   const chosen = new Set<SessionItem>([...humans, ...agents]);
-  const lines = [`SESSION ${s.date}, project ${s.project} (id ${s.sessionId.slice(0, 8)})`];
+  const lines = [`SESSION ${sessionDateRange(s)}, project ${s.project} (id ${s.sessionId.slice(0, 8)})`];
   let size = lines[0].length;
   for (const item of s.items) {
     if (!chosen.has(item)) continue;
@@ -297,7 +392,9 @@ export function buildHarvestDigest(sessions: ScannedSession[], budget: number = 
   const info = (s: ScannedSession, block: string): SessionDigestInfo => ({
     sessionId: s.sessionId,
     project: s.project,
+    startDate: s.startDate,
     date: s.date,
+    messages: s.items.length,
     chars: block.length,
   });
   return {
@@ -328,7 +425,9 @@ function asString(v: unknown): string | null {
  * Models often end the last sentence with an inline citation ("... in
  * testing. source: session 2026-08-15, project x") instead of giving it its
  * own line, and the standard source detection (and therefore the 0.85 cap)
- * only sees line-start `source:` lines. This purely mechanical fix moves the
+ * only sees line-start `source:` lines. Both the single-day form and the
+ * date-range form ("source: session 2026-08-12 to 2026-08-18, project x")
+ * are recognized. This purely mechanical fix moves the
  * LAST inline session citation onto its own line: it inserts a line break
  * and changes no words. Bodies already carrying a line-start source line, or
  * carrying no session citation at all, come back unchanged.
@@ -449,6 +548,7 @@ export function dedupeAgainstBrain(
 
 export function harvestProposerPrompt(digestText: string): string {
   return [
+    INTERNAL_RUN_MARKER,
     'You are the HARVESTER in a memory bootstrap pass over an agent memory directory called a brain.',
     "Below are digests of the owner's recent Claude Code sessions: the human's own messages and the assistant's main conclusions, oldest session first.",
     "Distill them into zero or more atomic notes worth keeping across future sessions, ONLY from this closed set of types:",
@@ -460,7 +560,7 @@ export function harvestProposerPrompt(digestText: string): string {
     "Rules:",
     '- Respond with ONLY a JSON object, no prose and no code fences: {"proposals": [{"type": ..., "title": ..., "body": ...}]}',
     `- One self-contained fact per note. Short stable title. Body of 2 to 6 sentences, under ${PROPOSAL_BODY_CHAR_CAP} characters.`,
-    "- Every body MUST end with a source line ON ITS OWN FINAL LINE naming the session it came from, exactly like: source: session 2026-08-15, project cookbook-app",
+    "- Every body MUST end with a source line ON ITS OWN FINAL LINE naming the session it came from, copying the date or date range from that session's SESSION header exactly. Single day: source: session 2026-08-15, project cookbook-app. A header spanning days: source: session 2026-08-12 to 2026-08-18, project phonestack.",
     "- Only distill what the digests actually say. Never invent details. Never propose tasks, edits, or merges of existing notes.",
     '- Propose nothing you are not confident about. {"proposals": []} is a good answer.',
     "- Do not use any tools. Answer from the digests alone.",
@@ -472,6 +572,7 @@ export function harvestProposerPrompt(digestText: string): string {
 }
 
 const HARVEST_REFUTER_HEADER_LINES = [
+  INTERNAL_RUN_MARKER,
   "You are the REFUTER reviewing memory notes proposed from digests of a developer's recent coding sessions. The proposals were produced by a separate pass; you have no memory of writing them and no loyalty to them.",
   "Your job is adversarial: reject any proposal the digests do not support, that guesses beyond what was actually said, that bundles more than one fact, or whose source line cites a session that does not appear in the digests. The digests below are the only evidence; judge against them, not the proposal's own claims.",
   "",
@@ -543,6 +644,10 @@ export interface HarvestOutcome {
   reportFile: string;
   reportText: string;
   sessionsScanned: number;
+  /** transcripts skipped because they are this tool's own claude -p runs */
+  internalRuns: number;
+  /** sessions whose substantive messages all fall outside the window */
+  noInWindow: number;
   sessionsDigested: number;
   droppedForBudget: SessionDigestInfo[];
   /** proposals that survived validation AND dedupe; refuter verdicts index into this list */
@@ -559,7 +664,8 @@ export interface HarvestOutcome {
 
 export function harvest(opts: HarvestOptions): HarvestOutcome {
   const now = opts.now ?? Date.now();
-  const sessions = scanSessions(opts.sessionsRoot, { now, days: opts.days, project: opts.project });
+  const scan = scanSessions(opts.sessionsRoot, { now, days: opts.days, project: opts.project });
+  const sessions = scan.sessions;
   const digest = buildHarvestDigest(sessions);
   const brain = loadBrain(opts.dir);
   const author: Author = { human: opts.human, agent: "harvest" };
@@ -677,6 +783,8 @@ export function harvest(opts: HarvestOptions): HarvestOutcome {
     apply: opts.apply,
     model: opts.model,
     sessionsScanned: sessions.length,
+    internalRuns: scan.internalRuns,
+    noInWindow: scan.noInWindow,
     digest,
     proposals,
     invalid,
@@ -695,6 +803,8 @@ export function harvest(opts: HarvestOptions): HarvestOutcome {
     reportFile,
     reportText,
     sessionsScanned: sessions.length,
+    internalRuns: scan.internalRuns,
+    noInWindow: scan.noInWindow,
     sessionsDigested: digest.included.length,
     droppedForBudget: digest.dropped,
     proposals,
@@ -720,6 +830,8 @@ interface ReportInput {
   apply: boolean;
   model?: string;
   sessionsScanned: number;
+  internalRuns: number;
+  noInWindow: number;
   digest: HarvestDigest;
   proposals: HarvestProposal[];
   invalid: InvalidHarvestProposal[];
@@ -733,7 +845,8 @@ interface ReportInput {
   lockNote: string | null;
 }
 
-const sessionLine = (s: SessionDigestInfo): string => `session ${s.date}, project ${s.project} (id ${s.sessionId.slice(0, 8)}, ${s.chars} chars)`;
+const sessionLine = (s: SessionDigestInfo): string =>
+  `session ${sessionDateRange(s)}, project ${s.project} (id ${s.sessionId.slice(0, 8)}, ${s.messages} in-window message(s), ${s.chars} chars)`;
 
 function renderReport(r: ReportInput): string {
   const digestBytes = Buffer.byteLength(r.digest.text, "utf8");
@@ -750,10 +863,12 @@ function renderReport(r: ReportInput): string {
     "",
     "## Sessions",
     "",
-    `- sessions in window: ${r.sessionsScanned}`,
+    `- sessions with in-window activity: ${r.sessionsScanned} (windowed by message timestamp, not file age)`,
+    `- skipped: ${r.internalRuns} internal tool run(s) (this tool's own claude -p calls)`,
     `- digested: ${r.digest.included.length} (${digestBytes} bytes total; see exactly what leaves for the model with --dry-digest)`,
     `- what was read: transcript content (the human's messages and the assistant's conclusions), sent only to your own claude CLI`,
   ];
+  if (r.noInWindow > 0) lines.push(`- no in-window activity: ${r.noInWindow} session(s) (touched files whose messages all predate the window)`);
   if (r.digest.dropped.length > 0) {
     lines.push(`- dropped to fit the ${HARVEST_DIGEST_CHAR_BUDGET} char digest budget (oldest first): ${r.digest.dropped.length}`);
     for (const s of r.digest.dropped) lines.push(`  - ${sessionLine(s)}`);

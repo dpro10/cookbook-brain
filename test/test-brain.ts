@@ -54,7 +54,7 @@ import {
   ulid,
   type Note,
 } from "../src/store.ts";
-import { REFUTER_PROMPT_CHAR_CAP, buildDigest, extractJson, hygieneFindings, planReview, type Proposal } from "../src/dream.ts";
+import { INTERNAL_RUN_MARKER, REFUTER_PROMPT_CHAR_CAP, buildDigest, extractJson, hygieneFindings, planReview, type Proposal } from "../src/dream.ts";
 import {
   HARVEST_DIGEST_CHAR_BUDGET,
   HARVEST_PROMPT_CHAR_CAP,
@@ -64,9 +64,11 @@ import {
   digestSession,
   harvestProposerPrompt,
   harvestRefuterPrompt,
+  isInternalRunPrompt,
   normalizeSourceLine,
   planHarvestReview,
   scanSessions,
+  sessionDateRange,
   trigramOverlap,
   validateHarvestProposals,
   wordTrigrams,
@@ -2202,22 +2204,40 @@ function makeSessionsRoot(): string {
     { type: "user", timestamp: hIso(2, 0), cwd: cwdOther, message: { role: "user", content: "In other-proj the staging DB resets nightly at 02:00 UTC, so do not debug missing rows at 02:05." } },
     { type: "assistant", timestamp: hIso(2, 1), cwd: cwdOther, message: { role: "assistant", content: [{ type: "text", text: "Understood: the staging database resets nightly at 02:00 UTC, so rows missing right after that window are expected rather than a bug." }] } },
   ]);
-  // outside the 7-day window by timestamp (mtime is fresh, so the timestamp filter must catch it)
+  // outside the 7-day window by MESSAGE timestamp (mtime is fresh, so the per-message window must catch it)
   writeJsonl(path.join(other, "sess-old-3333.jsonl"), [
     { type: "user", timestamp: hIso(30, 0), cwd: cwdOther, message: { role: "user", content: "OLD_SESSION_MUST_NOT_APPEAR because it is outside the window." } },
   ]);
+  // one of the tool's own claude -p runs: first user message is our prompt, marker first line
+  const brainDir = path.join(root, "-Users-diego-Desktop-cookbook-brain");
+  const cwdBrain = "/Users/diego/Desktop/cookbook-brain";
+  writeJsonl(path.join(brainDir, "sess-int-4444.jsonl"), [
+    { type: "queue-operation", timestamp: hIso(0, -20) },
+    { type: "user", timestamp: hIso(0, -19), cwd: cwdBrain, message: { role: "user", content: `${INTERNAL_RUN_MARKER}\nYou are the HARVESTER in a memory bootstrap pass.\nINTERNAL_RUN_MUST_NOT_APPEAR in any digest.` } },
+    { type: "assistant", timestamp: hIso(0, -18), cwd: cwdBrain, message: { role: "assistant", content: [{ type: "text", text: 'INTERNAL_RUN_MUST_NOT_APPEAR: {"proposals": []} padded well past one hundred characters so it would otherwise count as a conclusion.' }] } },
+  ]);
+  // a genuinely old file: old messages AND old mtime, so the cheap pre-filter skips it before parsing
+  const ancient = path.join(other, "sess-ancient-5555.jsonl");
+  writeJsonl(ancient, [
+    { type: "user", timestamp: hIso(45, 0), cwd: cwdOther, message: { role: "user", content: "ANCIENT_FILE_MUST_NOT_APPEAR because both its mtime and its messages predate the window." } },
+  ]);
+  fs.utimesSync(ancient, new Date(HNOW - 45 * DAY), new Date(HNOW - 45 * DAY));
   return root;
 }
 
 check("harvest scan: reads content, skips tool noise, meta, subagents, summaries, malformed lines, and old sessions", () => {
   const root = makeSessionsRoot();
   try {
-    const sessions = scanSessions(root, { now: HNOW, days: 7 });
+    const scan = scanSessions(root, { now: HNOW, days: 7 });
+    const sessions = scan.sessions;
     assert.deepEqual(sessions.map((s) => s.project), ["other-proj", "cookbook-app"], "chronological order, oldest first, project from cwd basename");
     const app = sessions[1];
     assert.equal(app.sessionId, "sess-aaaa-1111");
-    assert.equal(app.date, hIso(1, 7).slice(0, 10), "the session date is its last activity's date");
+    assert.equal(app.date, hIso(1, 7).slice(0, 10), "the session date is its last in-window activity's date");
+    assert.equal(app.startDate, hIso(1, 0).slice(0, 10), "the session's start date is its first in-window message's date");
     assert.deepEqual(app.items.map((i) => i.role), ["human", "agent", "human"], "two substantive human messages and one long conclusion survive");
+    assert.equal(scan.internalRuns, 1, "the tool's own claude -p run must be skipped and counted");
+    assert.equal(scan.noInWindow, 1, "the fresh-mtime file whose messages are all old counts as no-in-window; the ancient-mtime file is pre-filtered and never counted");
     const digest = buildHarvestDigest(sessions);
     assert.deepEqual(digest.dropped, [], "two small sessions fit the budget");
     assert.ok(digest.text.includes("SESSION"), digest.text);
@@ -2226,10 +2246,12 @@ check("harvest scan: reads content, skips tool noise, meta, subagents, summaries
     assert.ok(digest.text.includes("never deploy on Fridays"), digest.text);
     assert.ok(digest.text.includes("agent: Done: the poll interval is 30 seconds"), digest.text);
     assert.ok(digest.text.includes("staging DB resets nightly"), digest.text);
-    for (const banned of ["SUBAGENT", "TOOL_RESULT_NOISE", "TOOL_USE_NOISE", "META_NOISE", "OLD_SESSION", "<command-name>", "summaries are not conversation", "agent: ok"]) {
+    for (const banned of ["SUBAGENT", "TOOL_RESULT_NOISE", "TOOL_USE_NOISE", "META_NOISE", "OLD_SESSION", "INTERNAL_RUN", "ANCIENT_FILE", "<command-name>", "summaries are not conversation", "agent: ok"]) {
       assert.ok(!digest.text.includes(banned), `digest must not contain ${banned}`);
     }
     assert.ok(digest.text.indexOf("staging DB") < digest.text.indexOf("poll interval"), "sessions must read oldest first");
+    assert.equal(digest.included[1].messages, 3, "the digest info carries the in-window message count");
+    assert.equal(digest.included[1].startDate, app.startDate, "the digest info carries the slice's start date");
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -2239,20 +2261,73 @@ check("harvest scan: --days narrows the window and --project filters by cwd base
   const root = makeSessionsRoot();
   try {
     const recent = scanSessions(root, { now: HNOW, days: 1 });
-    assert.deepEqual(recent.map((s) => s.project), ["cookbook-app"], "the 2-day-old session must leave a 1-day window");
+    assert.deepEqual(recent.sessions.map((s) => s.project), ["cookbook-app"], "the 2-day-old session must leave a 1-day window");
     const filtered = scanSessions(root, { now: HNOW, days: 7, project: "Cookbook-App" });
-    assert.deepEqual(filtered.map((s) => s.project), ["cookbook-app"], "the project filter matches case-insensitively");
+    assert.deepEqual(filtered.sessions.map((s) => s.project), ["cookbook-app"], "the project filter matches case-insensitively");
     const other = scanSessions(root, { now: HNOW, days: 7, project: "other-proj" });
-    assert.deepEqual(other.map((s) => s.sessionId), ["sess-bbbb-2222"]);
-    assert.deepEqual(scanSessions(root, { now: HNOW, days: 7, project: "no-such-project" }), []);
-    assert.deepEqual(scanSessions(path.join(root, "definitely-missing"), { now: HNOW, days: 7 }), [], "a missing root scans to empty, never throws");
+    assert.deepEqual(other.sessions.map((s) => s.sessionId), ["sess-bbbb-2222"]);
+    assert.deepEqual(scanSessions(root, { now: HNOW, days: 7, project: "no-such-project" }).sessions, []);
+    assert.deepEqual(scanSessions(path.join(root, "definitely-missing"), { now: HNOW, days: 7 }).sessions, [], "a missing root scans to empty, never throws");
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
 
+check("harvest scan: a long-lived session is windowed by MESSAGE timestamp, and old history never reaches the digest", () => {
+  const root = tmpdir("brain-longlived-");
+  try {
+    const proj = path.join(root, "-Users-diego-Desktop-phonestack");
+    const cwd = "/Users/diego/Desktop/phonestack";
+    // one session file kept alive for months: file mtime is fresh, but most messages predate the window
+    writeJsonl(path.join(proj, "sess-long-9999.jsonl"), [
+      { type: "user", timestamp: hIso(60, 0), cwd, message: { role: "user", content: "ANCIENT_DECISION_MUST_NOT_APPEAR: back in June we picked SwiftUI over UIKit." } },
+      { type: "assistant", timestamp: hIso(60, 1), cwd, message: { role: "assistant", content: [{ type: "text", text: "ANCIENT_CONCLUSION_MUST_NOT_APPEAR even though this conclusion easily clears the one hundred character floor for agent conclusions." }] } },
+      { type: "user", timestamp: hIso(5, 0), cwd, message: { role: "user", content: "This week we locked the sonar sampling rate at 48 kilohertz for the wearable." } },
+      { type: "user", timestamp: hIso(2, 0), cwd, message: { role: "user", content: "And the revenue track ships before the sonar demo, that ordering is settled." } },
+      { type: "assistant", timestamp: hIso(2, 1), cwd, message: { role: "assistant", content: [{ type: "text", text: "Settled then: revenue track first, sonar demo second, and the sampling rate stays at 48 kilohertz for the wearable hardware." }] } },
+    ]);
+    const scan = scanSessions(root, { now: HNOW, days: 7 });
+    assert.equal(scan.sessions.length, 1);
+    assert.equal(scan.noInWindow, 0, "a session WITH in-window messages is digested, not counted out");
+    const s = scan.sessions[0];
+    assert.equal(s.items.length, 3, "only the three in-window messages survive");
+    assert.equal(s.startDate, hIso(5, 0).slice(0, 10), "attribution starts at the first IN-WINDOW message, not the file's first message");
+    assert.equal(s.date, hIso(2, 1).slice(0, 10), "attribution ends at the last in-window message");
+    const digest = buildHarvestDigest(scan.sessions);
+    assert.ok(digest.text.includes(`SESSION ${sessionDateRange(s)}, project phonestack`), digest.text);
+    assert.ok(digest.text.includes(`${s.startDate} to ${s.date}`), "a multi-day slice reads as a range in the header");
+    assert.ok(digest.text.includes("sonar sampling rate"), digest.text);
+    assert.ok(!digest.text.includes("ANCIENT_DECISION"), "old human messages must NEVER reach the digest");
+    assert.ok(!digest.text.includes("ANCIENT_CONCLUSION"), "old agent conclusions must NEVER reach the digest");
+    assert.equal(digest.included[0].messages, 3);
+    // the range helper itself: single-day slices stay bare
+    assert.equal(sessionDateRange({ startDate: "2026-08-18", date: "2026-08-18" }), "2026-08-18");
+    assert.equal(sessionDateRange({ startDate: "2026-08-12", date: "2026-08-18" }), "2026-08-12 to 2026-08-18");
+    // shrinking the window drops the older half of the slice
+    const narrow = scanSessions(root, { now: HNOW, days: 3 }).sessions;
+    assert.equal(narrow.length, 1);
+    assert.equal(narrow[0].items.length, 2, "a 3-day window keeps only the 2-day-old messages");
+    assert.ok(!buildHarvestDigest(narrow).text.includes("sonar sampling rate"), "the 5-day-old message leaves a 3-day window");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+check("harvest scan: internal-run detection matches the marker and the legacy prompt preambles, never real work", () => {
+  assert.ok(isInternalRunPrompt(`${INTERNAL_RUN_MARKER}\nYou are the HARVESTER in a memory bootstrap pass.`), "the marker is the exact detector");
+  assert.ok(isInternalRunPrompt("You are the HARVESTER in a memory bootstrap pass over an agent memory directory called a brain."), "pre-marker harvest proposer transcripts");
+  assert.ok(isInternalRunPrompt("You are the REFUTER reviewing memory notes proposed from digests of a developer's recent coding sessions."), "pre-marker harvest refuter transcripts");
+  assert.ok(isInternalRunPrompt('You are the PROPOSER in a memory consolidation pass ("dream") over an agent memory directory called a brain.'), "pre-marker dream proposer transcripts");
+  assert.ok(isInternalRunPrompt("You are the REFUTER reviewing consolidation proposals made over an agent memory."), "pre-marker dream refuter transcripts");
+  assert.ok(!isInternalRunPrompt("You are the best. Help me fix the harvester."), "ordinary praise is not an internal run");
+  assert.ok(!isInternalRunPrompt("Fix a correctness bug in the REFUTER prompt."), "talking ABOUT the prompts is not an internal run");
+  // every prompt this tool sends must open with the marker, so future transcripts are exactly detectable
+  assert.ok(harvestProposerPrompt("d").startsWith(INTERNAL_RUN_MARKER));
+  assert.ok(harvestRefuterPrompt([], "d").startsWith(INTERNAL_RUN_MARKER));
+});
+
 check("harvest digest: flattens whitespace, truncates long messages, and caps each session's digest", () => {
-  const base: ScannedSession = { sessionId: "s1", project: "p", date: "2026-08-17", end: hIso(1), items: [] };
+  const base: ScannedSession = { sessionId: "s1", project: "p", startDate: "2026-08-17", date: "2026-08-17", end: hIso(1), items: [] };
   const spaced = digestSession({ ...base, items: [{ role: "human", text: "line one\nline two   spaced" }] });
   assert.ok(spaced.includes("human: line one line two spaced"), spaced);
   const long = digestSession({ ...base, items: [{ role: "human", text: "x".repeat(900) }] });
@@ -2267,6 +2342,7 @@ check("harvest digest budget: oldest sessions are dropped first and recorded; su
   const mk = (i: number): ScannedSession => ({
     sessionId: `sess-${i}`,
     project: "p",
+    startDate: hIso(6 - i).slice(0, 10),
     date: hIso(6 - i).slice(0, 10),
     end: hIso(6 - i),
     items: [{ role: "human", text: `session number ${i} says something substantive` }],
@@ -2336,15 +2412,24 @@ check("harvest validation: an INLINE session citation is moved onto its own line
   assert.equal(normalizeSourceLine(already), already, "a body already carrying a source line is untouched");
   const none = "A fact with no citation of any kind.";
   assert.equal(normalizeSourceLine(none), none, "nothing is invented for uncited bodies");
+  // the date-RANGE form from long-lived sessions normalizes and validates the same way
+  const inlineRange = "The sonar sampling rate is locked at 48 kilohertz. source: session 2026-08-12 to 2026-08-18, project phonestack";
+  const fixedRange = normalizeSourceLine(inlineRange);
+  assert.ok(fixedRange.endsWith("\n\nsource: session 2026-08-12 to 2026-08-18, project phonestack"), fixedRange);
+  assert.ok(isSourced(fixedRange), "the range form must pass the standard source detection");
   const { proposals, invalid } = validateHarvestProposals({
     proposals: [
       { type: "convention", title: "Inline citation", body: inline },
       { type: "note", title: "Wrong type stays wrong", body: inline },
       { type: "gotcha", title: "Still uncited", body: none },
+      { type: "decision", title: "Range citation", body: inlineRange },
+      { type: "decision", title: "Range on its own line", body: "Revenue track ships first.\n\nsource: session 2026-08-12 to 2026-08-18, project phonestack" },
     ],
   });
-  assert.equal(proposals.length, 1, JSON.stringify(invalid));
+  assert.equal(proposals.length, 3, JSON.stringify(invalid));
   assert.ok(isSourced(proposals[0].body), "validated bodies must carry a line-start source line");
+  assert.ok(proposals.some((p) => p.title === "Range citation"), "the range form must survive validation");
+  assert.ok(proposals.some((p) => p.title === "Range on its own line"));
   assert.equal(invalid.length, 2);
   assert.ok(invalid.some((i) => i.reason.includes("must cite its session")), JSON.stringify(invalid));
 });
@@ -2510,6 +2595,11 @@ check("cli harvest report-only: full report with refuter: ran, and NOTHING writt
     assert.ok(report.includes('Proposal 0: decision "Poll interval is 30s"'), report);
     assert.ok(report.includes("proposal 0: keep"), report);
     assert.ok(report.includes("transcript content"), "the report must say plainly that content was read");
+    assert.ok(report.includes("skipped: 1 internal tool run(s)"), "the tool's own claude -p run must be counted in the report");
+    assert.ok(report.includes("no in-window activity: 1 session(s)"), "the touched-but-old session must be counted, not listed");
+    assert.ok(report.includes("windowed by message timestamp"), report);
+    assert.ok(/session \d{4}-\d{2}-\d{2}[^\n]*project cookbook-app \(id sess-aaa[^\n]*3 in-window message\(s\)/.test(report), "per-session lines carry dates and in-window message counts");
+    assert.ok(r.stdout.includes("1 internal tool run(s) skipped"), r.stdout);
     assert.ok(report.includes("report-only run: nothing was applied"), report);
     assert.ok(report.includes("git revert"), "the report must say how to undo");
     assert.equal(loadBrain(dir).notes.length, 0, "report-only must write no notes");
@@ -2667,6 +2757,8 @@ check("cli harvest --json: machine-readable report with the budget drops recorde
     assert.equal(payload.brain, dir);
     assert.equal(payload.days, 2);
     assert.equal(payload.sessions_scanned, 12);
+    assert.equal(payload.internal_runs_skipped, 0, "the JSON report carries the internal-run count");
+    assert.equal(payload.no_in_window, 0, "the JSON report carries the no-in-window count");
     assert.ok(payload.sessions_digested < 12, "the budget must force drops");
     assert.ok(payload.dropped_for_budget.length > 0, "drops must be recorded");
     assert.equal(payload.sessions_digested + payload.dropped_for_budget.length, 12);

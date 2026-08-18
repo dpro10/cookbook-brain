@@ -51,6 +51,16 @@ import {
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
+/**
+ * The first line of every prompt this tool sends through `claude -p`. Print-
+ * mode calls leave transcripts in ~/.claude/projects like any other session,
+ * and harvest must never digest the tool's own runs as if they were the
+ * human's work. This stable marker makes those transcripts exactly
+ * detectable: harvest skips any session whose first user message starts with
+ * it (see isInternalRunPrompt in harvest.ts).
+ */
+export const INTERNAL_RUN_MARKER = "[cookbook-brain internal run]";
+
 /** Output token ceilings, enforced through the Claude Code CLI's own env knob. */
 const PROPOSER_MAX_OUTPUT_TOKENS = 8000;
 const REFUTER_MAX_OUTPUT_TOKENS = 4000;
@@ -373,6 +383,7 @@ function sourceIdsOf(p: Proposal): string[] {
 export function proposerPrompt(digestText: string, hygiene: HygieneFindings): string {
   const hygieneSection = hygieneLines(hygiene);
   return [
+    INTERNAL_RUN_MARKER,
     'You are the PROPOSER in a memory consolidation pass ("dream") over an agent memory directory called a brain.',
     "Each digest line below is one active note as JSON: id, type, title, credits (times the note proved true in completed work), age_days, and the first 280 characters of the body.",
     "",
@@ -398,6 +409,7 @@ export function proposerPrompt(digestText: string, hygiene: HygieneFindings): st
 }
 
 const REFUTER_HEADER_LINES = [
+  INTERNAL_RUN_MARKER,
   "You are the REFUTER reviewing consolidation proposals made over an agent memory. The proposals were produced by a separate pass; you have no memory of writing them and no loyalty to them.",
   "Your job is adversarial: reject any proposal that loses information, merges notes that do not state the same fact, promotes something unproven, flags a contradiction that is not one, or picks a worse title. The full text of every source note is below; judge against the notes themselves, not the proposal's own claims.",
   "",
