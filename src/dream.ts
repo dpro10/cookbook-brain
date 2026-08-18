@@ -75,7 +75,7 @@ export function findClaudeBinary(env: NodeJS.ProcessEnv = process.env): string |
   return null;
 }
 
-interface ClaudeCallResult {
+export interface ClaudeCallResult {
   ok: boolean;
   stdout: string;
   error?: string;
@@ -84,9 +84,10 @@ interface ClaudeCallResult {
 /**
  * One `claude -p` call over the user's own CLI login. The prompt goes in on
  * stdin; the output token ceiling rides the CLAUDE_CODE_MAX_OUTPUT_TOKENS
- * environment variable that Claude Code itself honors.
+ * environment variable that Claude Code itself honors. Shared with harvest,
+ * which reuses the same invocation pattern.
  */
-function runClaude(prompt: string, opts: { model?: string; maxOutputTokens: number; timeoutMs: number }): ClaudeCallResult {
+export function runClaude(prompt: string, opts: { model?: string; maxOutputTokens: number; timeoutMs: number }): ClaudeCallResult {
   const args = ["-p"];
   if (opts.model) args.push("--model", opts.model);
   const r = spawnSync("claude", args, {
