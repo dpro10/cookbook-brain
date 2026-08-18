@@ -16,10 +16,14 @@ import path from "node:path";
 import {
   LOCK_STALE_MS,
   abandonTask,
+  filenameMismatches,
   fixTitleAliases,
   hasTitleAlias,
+  migrateFilenames,
   missingTitleAlias,
   renderIndexMd,
+  sanitizeTitleForFilename,
+  suffixedNoteFilename,
   acquireLock,
   activeConventions,
   activeLock,
@@ -155,11 +159,35 @@ check("ulid: 26 Crockford chars, lexically sortable by time", () => {
   assert.notEqual(ulid(), ulid(), "same-millisecond ids must differ");
 });
 
-check("slugify + filename convention", () => {
+check("slugify still recognizes the pre-0.7.1 convention", () => {
   assert.equal(slugify("Use pnpm everywhere"), "use-pnpm-everywhere");
   assert.equal(slugify("  Weird:: title / with (stuff)  "), "weird-title-with-stuff");
   assert.equal(slugify("???"), "untitled");
-  assert.equal(noteFilename("2026-08-18T10:00:00.000Z", "Use pnpm everywhere"), "2026-08-18--use-pnpm-everywhere.md");
+});
+
+check("filenames are titles: sanitization replaces only illegal characters, preserving spaces, punctuation, and case", () => {
+  // the table: each troublesome character becomes a hyphen
+  assert.equal(sanitizeTitleForFilename("Routing: app dir"), "Routing- app dir");
+  assert.equal(sanitizeTitleForFilename("docs/brief"), "docs-brief");
+  assert.equal(sanitizeTitleForFilename("a\\b"), "a-b");
+  assert.equal(sanitizeTitleForFilename("pipe | dream"), "pipe - dream");
+  assert.equal(sanitizeTitleForFilename("use [[app]] dir"), "use -app- dir");
+  assert.equal(sanitizeTitleForFilename("issue #42"), "issue -42");
+  assert.equal(sanitizeTitleForFilename("2^10 is 1024"), "2-10 is 1024");
+  assert.equal(sanitizeTitleForFilename("tab\there"), "tab-here");
+  // runs of illegal characters collapse to ONE hyphen, and edges are trimmed
+  assert.equal(sanitizeTitleForFilename("a://///b"), "a-b");
+  assert.equal(sanitizeTitleForFilename("[bracketed title]"), "bracketed title");
+  assert.equal(sanitizeTitleForFilename("  /leading and trailing/  "), "leading and trailing");
+  // what Obsidian loves stays: spaces, normal punctuation, title case, unicode
+  assert.equal(sanitizeTitleForFilename("Poll interval is 30s, not 10"), "Poll interval is 30s, not 10");
+  assert.equal(sanitizeTitleForFilename("Don't panic (usually)."), "Don't panic (usually).");
+  assert.equal(sanitizeTitleForFilename("Ünïcode & emoji 🚀 stay"), "Ünïcode & emoji 🚀 stay");
+  assert.equal(sanitizeTitleForFilename("self-hosted is non-negotiable"), "self-hosted is non-negotiable");
+  // nothing left means Untitled
+  assert.equal(sanitizeTitleForFilename(":::"), "Untitled");
+  assert.equal(noteFilename("Routing: app dir"), "Routing- app dir.md");
+  assert.equal(suffixedNoteFilename("Same title", "01J8ZZ00000000000000004X2XMC"), "Same title (4x2xmc).md");
 });
 
 // ---- frontmatter round-trip ----
@@ -219,7 +247,7 @@ check("store round-trip: createNote writes a file loadBrain reads back", () => {
       author: { human: "diego", agent: "Claude Code" },
     });
     assert.ok(fs.existsSync(written.file));
-    assert.match(path.basename(written.file), /^\d{4}-\d{2}-\d{2}--tabs-are-two-spaces\.md$/);
+    assert.equal(path.basename(written.file), "Tabs are two spaces.md", "the filename is the title, so Obsidian resolves [[Title]] natively");
     const brain = loadBrain(dir);
     assert.equal(brain.problems.length, 0);
     assert.equal(brain.notes.length, 1);
@@ -229,16 +257,40 @@ check("store round-trip: createNote writes a file loadBrain reads back", () => {
   }
 });
 
-check("store: same-day duplicate titles get distinct files, nothing overwritten", () => {
+check("store: duplicate titles collide into an id-suffixed file, nothing overwritten", () => {
   const dir = tmpdir("brain-dup-");
   try {
     const author = { human: "diego", agent: null };
     const a = createNote(dir, { type: "note", title: "Same title", body: "first", author });
     const b = createNote(dir, { type: "note", title: "Same title", body: "second", author });
     assert.notEqual(a.file, b.file);
+    assert.equal(path.basename(a.file), "Same title.md", "the first note keeps the plain title filename");
+    assert.equal(
+      path.basename(b.file),
+      `Same title (${b.id.slice(-6).toLowerCase()}).md`,
+      "the collision suffix is the last 6 of the ULID",
+    );
     const brain = loadBrain(dir);
     assert.equal(brain.notes.length, 2);
     assert.deepEqual(new Set(brain.notes.map((n) => n.body)), new Set(["first", "second"]));
+    // internal wikilink resolution is title-based, so the suffixed file still resolves
+    const c = createNote(dir, { type: "note", title: "Linker", body: "See [[Same title]] for details.", author });
+    assert.ok(backlinksFor(loadBrain(dir), a).some((l) => l.id === c.id), "title-based backlinks survive suffixed filenames");
+    // doctor flags the suffixed file as a filename warning (the rare, documented ghost case)
+    const mismatched = filenameMismatches(loadBrain(dir));
+    assert.deepEqual(mismatched.map((n) => path.basename(n.file)), [path.basename(b.file)]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+check("store: a note titled like a reserved file (SCHEMA, README, INDEX) never claims the reserved name", () => {
+  const dir = tmpdir("brain-reserved-");
+  try {
+    const author = { human: "diego", agent: null };
+    const schema = createNote(dir, { type: "note", title: "SCHEMA", body: "would vanish as SCHEMA.md", author });
+    assert.notEqual(path.basename(schema.file), "SCHEMA.md", "SCHEMA.md is excluded from scanning, so a note may not claim it");
+    assert.equal(loadBrain(dir).notes.length, 1, "the note stays visible to the scanner");
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -3526,6 +3578,207 @@ check("cli log: surfaces recent harvest reports with kept-but-unapplied proposal
 });
 
 fs.rmSync(v7ShimDir, { recursive: true, force: true });
+
+// ---- v0.7.1: filenames are titles (Obsidian does NOT resolve [[links]] via aliases) ----
+
+/** Serialize a note to an OLD-convention date-slug filename, as pre-0.7.1 releases wrote them. */
+function writeOldStyleNote(dir: string, note: Omit<Note, "file">): string {
+  const file = path.join(dir, `${note.created.slice(0, 10)}--${slugify(note.title)}.md`);
+  fs.writeFileSync(file, serializeNote(note));
+  return file;
+}
+
+/** A pre-0.7.1 brain: date-slug files, a supersede pair, an illegal-character title, and a sanitized-title collision. */
+function seedOldConventionBrain(dir: string): { bytesByTitle: Map<string, string> } {
+  fs.mkdirSync(dir, { recursive: true });
+  const author = { human: "diego", agent: null };
+  const base = (n: number, title: string, body: string): Omit<Note, "file"> => ({
+    id: `01J8G0000000000000000000${String(n).padStart(2, "0")}`,
+    type: "note",
+    title,
+    aliases: [title],
+    author,
+    created: `2026-08-${String(n).padStart(2, "0")}T10:00:00.000Z`,
+    supersedes: null,
+    credits: 0,
+    last_credited: null,
+    body,
+  });
+  writeOldStyleNote(dir, base(1, "Use pnpm everywhere", "All repos use pnpm. See [[Cache: the rules]]."));
+  writeOldStyleNote(dir, base(2, "Cache: the rules", "The cache lives in .cache."));
+  // a supersede pair SHARING a title: the active half must win the plain filename
+  writeOldStyleNote(dir, { ...base(3, "Deploy policy", "old policy"), superseded_by: "01J8G000000000000000000004" });
+  writeOldStyleNote(dir, { ...base(4, "Deploy policy", "new policy"), created: "2026-08-04T10:00:00.000Z", supersedes: "01J8G000000000000000000003" });
+  // two ACTIVE notes whose titles sanitize to the same filename
+  writeOldStyleNote(dir, base(5, "a/b", "first slash note"));
+  writeOldStyleNote(dir, { ...base(6, "a:b", "colon twin"), created: "2026-08-06T10:00:00.000Z" });
+  fs.writeFileSync(path.join(dir, "SCHEMA.md"), "# This directory is a brain\n");
+  fs.mkdirSync(path.join(dir, "dreams"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "dreams", "harvested.json"), JSON.stringify({ "sess-1": { lastMessageTs: "2026-08-01T00:00:00.000Z", harvestedAt: "2026-08-02T00:00:00.000Z" } }));
+  fs.writeFileSync(path.join(dir, "dreams", "HARVEST_2026-08-02.md"), "# Harvest report\n");
+  const bytesByTitle = new Map<string, string>();
+  for (const n of loadBrain(dir).notes) bytesByTitle.set(`${n.id}`, fs.readFileSync(n.file, "utf8"));
+  return { bytesByTitle };
+}
+
+check("cli migrate-filenames: renames every old date-slug file to its title, byte-identical, printing old -> new", () => {
+  const dir = tmpdir("brain-migrate-");
+  try {
+    const { bytesByTitle } = seedOldConventionBrain(dir);
+    runCli(["index", "--dir", dir]); // an INDEX.md exists, so migration must regenerate it
+    const staleIndex = fs.readFileSync(path.join(dir, "INDEX.md"), "utf8");
+    assert.ok(staleIndex.length > 0);
+
+    const r = runCli(["migrate-filenames", "--dir", dir]);
+    assert.equal(r.status, 0, r.stderr + r.stdout);
+    assert.ok(r.stdout.includes("renamed 6 file(s)"), r.stdout);
+    assert.ok(r.stdout.includes("2026-08-01--use-pnpm-everywhere.md -> Use pnpm everywhere.md"), r.stdout);
+    assert.ok(r.stdout.includes("2026-08-02--cache-the-rules.md -> Cache- the rules.md"), "illegal characters sanitize to hyphens");
+    assert.ok(r.stdout.includes("regenerated INDEX.md"), r.stdout);
+
+    // the ACTIVE half of the supersede pair holds the plain name; the superseded half is suffixed
+    const brain = loadBrain(dir);
+    const activeDeploy = brain.byId.get("01J8G000000000000000000004")!;
+    const oldDeploy = brain.byId.get("01J8G000000000000000000003")!;
+    assert.equal(path.basename(activeDeploy.file), "Deploy policy.md", "the active note must win the plain filename");
+    assert.equal(path.basename(oldDeploy.file), "Deploy policy (000003).md", "the superseded twin gets the id suffix");
+    // the active-title collision: oldest active keeps the plain name, the twin is suffixed
+    assert.equal(path.basename(brain.byId.get("01J8G000000000000000000005")!.file), "a-b.md");
+    assert.equal(path.basename(brain.byId.get("01J8G000000000000000000006")!.file), "a-b (000006).md");
+
+    // contents are byte-identical: a migration is renames, never rewrites
+    for (const n of brain.notes) {
+      assert.equal(fs.readFileSync(n.file, "utf8"), bytesByTitle.get(n.id), `content of ${path.basename(n.file)} must not change`);
+    }
+    // dreams/ is a log directory: untouched
+    assert.ok(fs.existsSync(path.join(dir, "dreams", "harvested.json")));
+    assert.ok(fs.existsSync(path.join(dir, "dreams", "HARVEST_2026-08-02.md")));
+    assert.ok(fs.existsSync(path.join(dir, "SCHEMA.md")), "SCHEMA.md is not a note and stays put");
+    // INDEX.md was regenerated against the migrated brain
+    assert.notEqual(fs.readFileSync(path.join(dir, "INDEX.md"), "utf8"), "", "INDEX.md must exist after migration");
+
+    // doctor is clean: exit 0, no parse problems, and no filename warnings except the documented suffix cases
+    const doc = runCli(["doctor", "--dir", dir]);
+    assert.equal(doc.status, 0, doc.stdout + doc.stderr);
+    assert.ok(doc.stdout.includes("ok: every note parses"), doc.stdout);
+    assert.ok(doc.stdout.includes("a-b (000006).md"), "the suffixed active twin is warned about, gently");
+
+    // a second migration is a no-op
+    const again = runCli(["migrate-filenames", "--dir", dir]);
+    assert.equal(again.status, 0);
+    assert.ok(again.stdout.includes("nothing to rename"), again.stdout);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+check("migrateFilenames: refuses to overwrite a file it does not manage, skipping with a reason", () => {
+  const dir = tmpdir("brain-migrate-refuse-");
+  try {
+    const author = { human: "diego", agent: null };
+    writeOldStyleNote(dir, {
+      id: "01J8H000000000000000000001",
+      type: "note",
+      title: "Occupied name",
+      aliases: ["Occupied name"],
+      author,
+      created: "2026-08-01T10:00:00.000Z",
+      supersedes: null,
+      credits: 0,
+      last_credited: null,
+      body: "x",
+    });
+    // both targets are squatted by frontmatter-less junk files (as Obsidian ghost clicks create)
+    fs.writeFileSync(path.join(dir, "Occupied name.md"), "");
+    fs.writeFileSync(path.join(dir, "Occupied name (000001).md"), "");
+    const before = fs.readFileSync(path.join(dir, "2026-08-01--occupied-name.md"), "utf8");
+    const result = migrateFilenames(dir);
+    assert.deepEqual(result.renames, []);
+    assert.equal(result.skipped.length, 1);
+    assert.ok(result.skipped[0].reason.includes("nothing was overwritten"), result.skipped[0].reason);
+    assert.equal(fs.readFileSync(path.join(dir, "2026-08-01--occupied-name.md"), "utf8"), before, "the note stays where it was");
+    assert.equal(fs.readFileSync(path.join(dir, "Occupied name.md"), "utf8"), "", "the squatting file is never clobbered");
+    assert.equal(runCli(["migrate-filenames", "--dir", dir]).status, 1, "a skipped rename exits nonzero so it is never missed");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+check("scanner + doctor: frontmatter-less .md files are ignored gently, never errors", () => {
+  const dir = tmpdir("brain-notnote-");
+  try {
+    createNote(dir, { type: "note", title: "Real note", body: "x", author: { human: "d", agent: null } });
+    // what Obsidian leaves behind after a ghost-link click: an empty file, or plain prose
+    fs.writeFileSync(path.join(dir, "wikilink.md"), "");
+    fs.writeFileSync(path.join(dir, "Scribbles.md"), "just some prose, no frontmatter");
+    const brain = loadBrain(dir);
+    assert.equal(brain.notes.length, 1, "junk files are not notes");
+    assert.deepEqual(brain.problems, [], "junk files are not parse problems either");
+    assert.deepEqual(brain.notNotes.map((f) => path.basename(f)).sort(), ["Scribbles.md", "wikilink.md"]);
+    assert.deepEqual(diagnose(dir), [], "diagnose stays clean");
+    const doc = runCli(["doctor", "--dir", dir]);
+    assert.equal(doc.status, 0, "not-a-note files must never fail doctor");
+    assert.ok(doc.stdout.includes("wikilink.md: not a note (no frontmatter): ignored"), doc.stdout);
+    assert.ok(doc.stdout.includes("Scribbles.md: not a note (no frontmatter): ignored"), doc.stdout);
+    assert.ok(doc.stdout.includes("ok: every note parses"), doc.stdout);
+    // log does not count them as problem files
+    const log = runCli(["log", "--dir", dir]);
+    assert.ok(!log.stdout.includes("had problems"), log.stdout);
+    // a file with frontmatter but broken fields is still a real problem
+    fs.writeFileSync(path.join(dir, "Broken.md"), "---\nid: x\n---\nbody");
+    assert.equal(runCli(["doctor", "--dir", dir]).status, 1, "actual note attempts still validate hard");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+check("doctor: old date-slug filenames warn (not error) and teach migrate-filenames", () => {
+  const dir = tmpdir("brain-fnwarn-");
+  try {
+    writeOldStyleNote(dir, {
+      id: "01J8H000000000000000000002",
+      type: "note",
+      title: "Old style note",
+      aliases: ["Old style note"],
+      author: { human: "d", agent: null },
+      created: "2026-08-01T10:00:00.000Z",
+      supersedes: null,
+      credits: 0,
+      last_credited: null,
+      body: "y",
+    });
+    const r = runCli(["doctor", "--dir", dir]);
+    assert.equal(r.status, 0, "filename mismatches are warnings, not errors");
+    assert.ok(r.stdout.includes("1 filename warning(s)"), r.stdout);
+    assert.ok(r.stdout.includes("migrate-filenames"), "the warning must teach the fix");
+    assert.ok(r.stdout.includes("expected Old style note.md"), r.stdout);
+    runCli(["migrate-filenames", "--dir", dir]);
+    const after = runCli(["doctor", "--dir", dir]);
+    assert.ok(!after.stdout.includes("filename warning"), "after migration there is nothing to warn about");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+check("SCHEMA.md and INDEX.md contain no bare wikilinks, so Obsidian draws no ghost nodes from them", () => {
+  const stripCode = (text: string) =>
+    text
+      .replace(/```[\s\S]*?```/g, "") // fenced blocks: Obsidian never links inside them
+      .replace(/`[^`]*`/g, ""); // inline code
+  const cwd = tmpdir("brain-schema-links-");
+  try {
+    runCli(["init"], { cwd });
+    const schema = fs.readFileSync(path.join(cwd, "brain", "SCHEMA.md"), "utf8");
+    assert.ok(!stripCode(schema).includes("[["), "every wikilink example in SCHEMA.md must be code, never a live link");
+    assert.ok(schema.includes("`[[Wikipedia-style links]]`"), "the links example reads as inline code");
+    // the INDEX header prose: its [[wikilink]] mention must be inline code; the entries are REAL links on purpose
+    const empty = renderIndexMd({ dir: cwd, notes: [], byId: new Map(), byTitle: new Map(), problems: [], notNotes: [] }, NOW);
+    assert.ok(empty.includes("one `[[wikilink]]` per note"), empty);
+    assert.ok(!stripCode(empty).includes("[["), "an empty index carries no bare wikilinks at all");
+  } finally {
+    fs.rmSync(cwd, { recursive: true, force: true });
+  }
+});
 
 if (failures > 0) {
   console.error(`\n${failures} test(s) FAILED`);

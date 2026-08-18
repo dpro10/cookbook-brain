@@ -1,6 +1,6 @@
 {
   "name": "cookbook-brain",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Agent memory as plain markdown files in a git-friendly directory: typed, attributed, never-overwritten notes with wikilinks, served to any agent over MCP.",
   "type": "module",
   "bin": {

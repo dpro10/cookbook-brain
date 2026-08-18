@@ -32,10 +32,11 @@ export interface Note {
   type: NoteType;
   title: string;
   /**
-   * Obsidian aliases, always carrying the note's title. Filenames are
-   * date-slugged, so Obsidian resolves [[Title]] wikilinks through this
-   * field. Emitted on every new note; older notes may lack it (doctor warns,
-   * and `doctor --fix-aliases` stamps it in place as a sanctioned
+   * Obsidian aliases, always carrying the note's title. Aliases power
+   * Obsidian's autocomplete and search; they do NOT resolve raw [[Title]]
+   * wikilinks (proven empirically), which is why filenames are the titles
+   * themselves. Emitted on every new note; older notes may lack it (doctor
+   * warns, and `doctor --fix-aliases` backfills it in place as a sanctioned
    * frontmatter addition).
    */
   aliases?: string[];
@@ -114,6 +115,12 @@ export interface Brain {
   /** lowercased title -> note ids bearing that title */
   byTitle: Map<string, string[]>;
   problems: BrainProblem[];
+  /**
+   * top-level .md files that are not notes at all (no frontmatter block),
+   * e.g. empty files Obsidian created from a clicked ghost link. The scanner
+   * ignores them; doctor mentions them gently, never as errors.
+   */
+  notNotes: string[];
 }
 
 // ---- ids ----
@@ -379,6 +386,7 @@ export function parseNoteFile(file: string, content: string): ParsedFile {
 
 // ---- filenames ----
 
+/** The pre-0.7.1 slug, kept for recognizing old date-slug filenames. */
 export function slugify(title: string): string {
   const slug = title
     .toLowerCase()
@@ -389,8 +397,45 @@ export function slugify(title: string): string {
   return slug || "untitled";
 }
 
-export function noteFilename(created: string, title: string): string {
-  return `${created.slice(0, 10)}--${slugify(title)}.md`;
+/**
+ * Sanitize a title into a filename. The filename IS the title, because
+ * Obsidian resolves raw [[Title]] wikilinks by filename only: frontmatter
+ * aliases power autocomplete and search, not link resolution (proven
+ * empirically in Obsidian 1.13). Only characters that are illegal or
+ * troublesome in filenames and wikilinks are replaced with a hyphen:
+ * / \ : # ^ [ ] | and control characters. Repeated hyphens collapse to one,
+ * leading and trailing hyphens and whitespace are trimmed. Spaces, ordinary
+ * punctuation, and case are preserved: Obsidian loves human filenames.
+ */
+export function sanitizeTitleForFilename(title: string): string {
+  const cleaned = title
+    .replace(/[/\\:#^[\]|\u0000-\u001F\u007F]+/g, "-")
+    .replace(/-{2,}/g, "-")
+    .replace(/^[-\s]+|[-\s]+$/g, "");
+  return cleaned || "Untitled";
+}
+
+/**
+ * Top-level names the note scanner never reads. A note may not claim them,
+ * or it would vanish from the brain.
+ */
+const RESERVED_FILENAMES = new Set(["schema.md", "readme.md", "index.md"]);
+
+/** The filename for a note: the sanitized title itself, so Obsidian resolves [[Title]] links natively. */
+export function noteFilename(title: string): string {
+  return `${sanitizeTitleForFilename(title)}.md`;
+}
+
+/**
+ * The collision-suffixed filename: "<sanitized-title> (xxxxxx).md" using the
+ * last 6 characters of the note's ULID. Used when another file already holds
+ * the plain name. Internal wikilink resolution is title-based from
+ * frontmatter, so a suffixed file still resolves everywhere inside
+ * cookbook-brain; only a raw Obsidian [[Title]] click misses it, which
+ * doctor reports as a warning.
+ */
+export function suffixedNoteFilename(title: string, id: string): string {
+  return `${sanitizeTitleForFilename(title)} (${id.slice(-6).toLowerCase()}).md`;
 }
 
 // ---- scanning ----
@@ -408,8 +453,16 @@ export function listNoteFiles(dir: string): string[] {
 export function loadBrain(dir: string): Brain {
   const notes: Note[] = [];
   const problems: BrainProblem[] = [];
+  const notNotes: string[] = [];
   for (const file of listNoteFiles(dir)) {
-    const parsed = parseNoteFile(file, fs.readFileSync(file, "utf8"));
+    const content = fs.readFileSync(file, "utf8");
+    if (content.split("\n", 1)[0] !== "---") {
+      // no frontmatter at all: not a note (often an empty file Obsidian
+      // created from a clicked ghost link). Ignored, never an error.
+      notNotes.push(file);
+      continue;
+    }
+    const parsed = parseNoteFile(file, content);
     for (const p of parsed.problems) problems.push({ file, message: p });
     if (parsed.note) notes.push(parsed.note);
   }
@@ -426,7 +479,7 @@ export function loadBrain(dir: string): Brain {
     ids.push(n.id);
     byTitle.set(key, ids);
   }
-  return { dir, notes, byId, byTitle, problems };
+  return { dir, notes, byId, byTitle, problems, notNotes };
 }
 
 /** Notes that have not been superseded. Default recall works over these only. */
@@ -473,7 +526,8 @@ export function createNote(dir: string, input: CreateInput): Note {
     id: input.id ?? ulid(),
     type: input.type,
     title: input.title.trim(),
-    // Obsidian resolves [[Title]] links via aliases, since filenames are date-slugged
+    // the filename is the title (that is what resolves [[Title]] links in
+    // Obsidian); the alias powers Obsidian autocomplete and search
     aliases: [input.title.trim()],
     author: input.author,
     created,
@@ -493,10 +547,12 @@ export function createNote(dir: string, input: CreateInput): Note {
     note.claimed_by = null;
     note.result = null;
   }
-  let file = path.join(dir, noteFilename(created, note.title));
-  if (fs.existsSync(file)) {
-    // Same day + same slug: disambiguate with the id's random tail, still never overwriting.
-    file = path.join(dir, `${created.slice(0, 10)}--${slugify(note.title)}-${note.id.slice(-6).toLowerCase()}.md`);
+  const plain = noteFilename(note.title);
+  let file = path.join(dir, plain);
+  if (RESERVED_FILENAMES.has(plain.toLowerCase()) || fs.existsSync(file)) {
+    // Another file (or a reserved name like SCHEMA.md) already holds this
+    // filename: disambiguate with the id's random tail, still never overwriting.
+    file = path.join(dir, suffixedNoteFilename(note.title, note.id));
   }
   fs.writeFileSync(file, serializeNote(note), { flag: "wx" });
   return { ...note, file };
@@ -1016,7 +1072,9 @@ export function renderIndexMd(brain: Brain, now: number = Date.now()): string {
   const lines: string[] = [
     "# Brain index",
     "",
-    "A generated view of this brain's active notes, one [[wikilink]] per note.",
+    // the `[[wikilink]]` mention is inline code on purpose: a bare one here
+    // would put a ghost "wikilink" node in Obsidian's graph
+    "A generated view of this brain's active notes, one `[[wikilink]]` per note.",
     "Regenerating with `cookbook-brain index` overwrites this file: it is a view,",
     "not a note, and the note scanner ignores it (like SCHEMA.md).",
     "",
@@ -1054,15 +1112,15 @@ export function renderIndexMd(brain: Brain, now: number = Date.now()): string {
 
 // ---- Obsidian aliases ----
 
-/** True when the note's aliases include its own title (case-insensitive), so Obsidian [[Title]] links resolve to it. */
+/** True when the note's aliases include its own title (case-insensitive), so Obsidian autocomplete and search offer it by title. */
 export function hasTitleAlias(note: Note): boolean {
   return (note.aliases ?? []).some((a) => a.trim().toLowerCase() === note.title.toLowerCase());
 }
 
 /**
  * Active notes missing an alias matching their title. Doctor warns about
- * these (Obsidian cannot resolve [[Title]] wikilinks to a date-slugged
- * filename without the alias); `doctor --fix-aliases` stamps them.
+ * these (the alias feeds Obsidian autocomplete and search; link resolution
+ * itself comes from the filename); `doctor --fix-aliases` backfills them.
  */
 export function missingTitleAlias(brain: Brain): Note[] {
   return activeNotes(brain).filter((n) => !hasTitleAlias(n));
@@ -1078,6 +1136,70 @@ export function missingTitleAlias(brain: Brain): Note[] {
 export function fixTitleAliases(dir: string): Note[] {
   const brain = loadBrain(dir);
   return missingTitleAlias(brain).map((note) => stampNote({ ...note, aliases: [...(note.aliases ?? []), note.title] }));
+}
+
+// ---- filenames as titles ----
+
+/**
+ * Active notes whose on-disk basename is not the sanitized title. Two ways
+ * this happens: the brain was written before v0.7.1 and still carries
+ * date-slug names (fix: `cookbook-brain migrate-filenames`), or the file
+ * carries a collision suffix because another file owns the plain name (rare,
+ * acceptable, and documented: a raw Obsidian [[Title]] click will not land
+ * on the suffixed file, though every cookbook-brain tool still resolves it
+ * by title). Doctor reports these as warnings, never errors.
+ */
+export function filenameMismatches(brain: Brain): Note[] {
+  return activeNotes(brain).filter((n) => path.basename(n.file) !== noteFilename(n.title));
+}
+
+export interface FilenameMigration {
+  renames: { from: string; to: string }[];
+  skipped: { file: string; reason: string }[];
+}
+
+/**
+ * Migrate every note file (active AND superseded) to the title-filename
+ * convention with plain fs renames, so git records renames and file contents
+ * stay byte-identical. Never overwrites: active notes claim plain names
+ * first (oldest first), superseded notes follow, and any collision gets the
+ * id-suffixed name; a rename whose targets are all taken is skipped and
+ * reported. Files that are not notes are left alone, and dreams/ (reports,
+ * harvested.json) is never touched: those are logs, keyed by session id,
+ * not filename.
+ */
+export function migrateFilenames(dir: string): FilenameMigration {
+  const brain = loadBrain(dir);
+  const renames: FilenameMigration["renames"] = [];
+  const skipped: FilenameMigration["skipped"] = [];
+  /** lowercased basenames claimed during this pass (also guards case-insensitive filesystems) */
+  const claimed = new Set<string>();
+  // actives first so a supersede pair sharing a title gives the ACTIVE note
+  // the plain name; within each group, oldest (id order) first
+  const ordered = [...activeNotes(brain), ...brain.notes.filter((n) => n.superseded_by !== undefined)];
+  for (const note of ordered) {
+    const from = path.basename(note.file);
+    const taken = (name: string): boolean =>
+      RESERVED_FILENAMES.has(name.toLowerCase()) ||
+      claimed.has(name.toLowerCase()) ||
+      (name.toLowerCase() !== from.toLowerCase() && fs.existsSync(path.join(dir, name)));
+    let to = noteFilename(note.title);
+    if (to !== from && taken(to)) to = suffixedNoteFilename(note.title, note.id);
+    if (to === from) {
+      claimed.add(to.toLowerCase());
+      continue;
+    }
+    if (taken(to)) {
+      // refusing to overwrite: even the suffixed target is held by a file
+      // that is not moving in this pass
+      skipped.push({ file: from, reason: `target ${to} already exists; nothing was overwritten` });
+      continue;
+    }
+    fs.renameSync(note.file, path.join(dir, to));
+    claimed.add(to.toLowerCase());
+    renames.push({ from, to });
+  }
+  return { renames, skipped };
 }
 
 // ---- brain lock ----

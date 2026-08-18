@@ -8,7 +8,9 @@
  *   credit   credit notes that proved true in completed work
  *   tasks    list open and claimed tasks with their age
  *   doctor   validate every note and the link/supersede graph
- *            (--fix-aliases stamps title aliases onto pre-alias notes)
+ *            (--fix-aliases backfills title aliases onto pre-alias notes)
+ *   migrate-filenames  rename pre-0.7.1 date-slug note files to title
+ *            filenames so Obsidian resolves [[Title]] links natively
  *   index    generate the INDEX.md view at the brain root
  *   web      serve the read-only local viewer on 127.0.0.1
  *   dream    offline consolidation: propose, refute, and (with --apply) apply
@@ -33,11 +35,14 @@ import {
   confidenceFor,
   creditNotes,
   diagnose,
+  filenameMismatches,
   fixTitleAliases,
   humanName,
   listTasks,
   loadBrain,
+  migrateFilenames,
   missingTitleAlias,
+  noteFilename,
   renderIndexMd,
   tierFor,
   type Note,
@@ -54,8 +59,11 @@ Commands:
   credit <id...>  credit notes whose facts held up in completed work
   tasks           list open and claimed tasks with their age
   doctor          validate every note, wikilink, supersedes chain, and task
+  migrate-filenames  rename note files from the pre-0.7.1 date-slug names to
+                  the title-filename convention (plain fs renames, contents
+                  untouched, prints every old -> new pair, never overwrites)
   index           generate INDEX.md at the brain root: every active note as a
-                  [[wikilink]] with its tier and credits, conventions first
+                  wikilink with its tier and credits, conventions first
                   (a view, not a note: regenerating overwrites it)
   web             serve a read-only local viewer at http://127.0.0.1:4321
                   (one page, no frameworks; localhost only, GET only)
@@ -74,8 +82,8 @@ Commands:
 
 Options:
   --dir <path>   brain directory (default ./brain; BRAIN_DIR env also works)
-  --fix-aliases  doctor: stamp a title alias onto active notes missing one, so
-                 Obsidian resolves [[Title]] wikilinks (a sanctioned stamp)
+  --fix-aliases  doctor: backfill a title alias onto active notes missing one,
+                 for Obsidian autocomplete and search (a sanctioned stamp)
   --port <n>     web: port for the read-only viewer (default 4321)
   --apply        dream/harvest: execute proposals the refuter kept (default: report-only)
   --commit       dream: after a successful apply, git commit the brain directory
@@ -137,12 +145,14 @@ The fields:
 - **id**: a ULID. Sortable by creation time, unique, never reused.
 - **type**: one of \`decision\`, \`gotcha\`, \`convention\`, \`note\`,
   \`open_thread\`, \`task\`.
-- **title**: short and stable. Other notes link to it by title.
-- **aliases**: a list that always carries the note's title. Filenames are
-  date-slugged, so Obsidian resolves \`[[Title]]\` wikilinks through this
-  field. Every new note gets it automatically; older notes can be stamped
-  with \`cookbook-brain doctor --fix-aliases\` (a sanctioned frontmatter
-  addition, see below).
+- **title**: short and stable. Other notes link to it by title, and the
+  FILENAME is the sanitized title, which is what lets Obsidian resolve
+  \`[[Title]]\` wikilinks natively (see "Filenames" below).
+- **aliases**: a list that always carries the note's title, for Obsidian
+  autocomplete and search (aliases do not resolve raw wikilinks; the
+  filename does). Every new note gets it automatically; older notes can be
+  backfilled with \`cookbook-brain doctor --fix-aliases\` (a sanctioned
+  frontmatter addition, see below).
 - **author.human**: the person this note is attributed to.
 - **author.agent**: the agent that wrote it, or \`null\` if the human wrote it
   themselves.
@@ -192,12 +202,27 @@ Tiers: \`proven\` means credited at least once AND scoring 0.80 or higher;
 \`standing\` means 0.60 or higher; everything else is \`verify\`, meaning
 check it before you build on it.
 
+## Filenames
+
+A note's filename is its title: \`Poll interval is 30s.md\`. That is not
+cosmetic; Obsidian resolves raw \`[[Title]]\` wikilinks by filename only
+(frontmatter aliases power autocomplete and search, not link resolution), so
+title filenames are what make the graph light up. Characters that are
+illegal or troublesome in filenames and wikilinks (\`/ \\ : # ^ [ ] |\` and
+control characters) are replaced with a hyphen; everything else, including
+spaces and case, is preserved. When two notes sanitize to the same name, the
+newcomer gets a short id suffix like \`Title (4x2xmc).md\`; every
+cookbook-brain tool still resolves it by title, and \`doctor\` points out
+the mismatch. Brains written before v0.7.1 used date-slug filenames;
+\`cookbook-brain migrate-filenames\` renames them in place (plain renames,
+contents byte-identical, nothing overwritten).
+
 ## Links
 
-Write another note's title in double brackets, like \`[[Docs routing
-decision]]\`, anywhere in a body. Those wikilinks form the graph: when a note
-is recalled, every note that links to it comes along as a backlink with its
-surrounding lines. Titles match case-insensitively.
+Write another note's title in double brackets, like
+\`[[Wikipedia-style links]]\`, anywhere in a body. Those wikilinks form the
+graph: when a note is recalled, every note that links to it comes along as a
+backlink with its surrounding lines. Titles match case-insensitively.
 
 ## The one rule: never overwrite
 
@@ -215,9 +240,11 @@ above. Task notes allow a third stamp set, on task-type notes only:
 \`status\`, \`claimed_by\`, \`result\`, and \`abandon_reason\`, which move a
 task through its lifecycle. One more sanctioned addition exists for notes
 written before aliases did: \`cookbook-brain doctor --fix-aliases\` stamps
-\`aliases: [<title>]\` onto an active note missing it, so Obsidian wikilinks
-resolve. Nothing else about an existing file is ever touched, and no stamp
-ever changes a body.
+\`aliases: [<title>]\` onto an active note missing it, feeding Obsidian
+autocomplete and search. Nothing else about an existing file's CONTENT is
+ever touched, and no stamp ever changes a body. (\`cookbook-brain
+migrate-filenames\` may RENAME a file to the title convention; the bytes
+inside never change.)
 
 Superseded notes are excluded from recall by default.
 
@@ -498,12 +525,24 @@ function cmdDoctor(dir: string, fixAliases: boolean): void {
   const brain = loadBrain(dir);
   const problems = diagnose(dir);
   console.log(`cookbook-brain doctor: ${brain.notes.length} parseable note(s) in ${dir}`);
+  if (brain.notNotes.length > 0) {
+    // gentle by design: files without frontmatter are simply not notes
+    // (usually empty files Obsidian created from a clicked ghost link)
+    for (const f of brain.notNotes) console.log(`  ${path.basename(f)}: not a note (no frontmatter): ignored`);
+  }
   const missing = missingTitleAlias(brain);
   if (missing.length > 0) {
     console.log(
-      `${missing.length} alias warning(s) (not errors): active notes missing an alias matching their title, so Obsidian [[wikilinks]] to them will not resolve. Stamp them with: cookbook-brain doctor --fix-aliases`,
+      `${missing.length} alias warning(s) (not errors): active notes missing an alias matching their title, so Obsidian autocomplete and search will not offer them by title. Stamp them with: cookbook-brain doctor --fix-aliases`,
     );
     for (const n of missing) console.log(`  ${path.basename(n.file)}: no alias matching "${n.title}"`);
+  }
+  const mismatched = filenameMismatches(brain);
+  if (mismatched.length > 0) {
+    console.log(
+      `${mismatched.length} filename warning(s) (not errors): active notes whose filename is not their title, so a raw Obsidian [[Title]] click will not land on them. Old date-slug names: run cookbook-brain migrate-filenames. Collision-suffixed names are expected; consider retitling one of the colliding notes.`,
+    );
+    for (const n of mismatched) console.log(`  ${path.basename(n.file)}: expected ${noteFilename(n.title)}`);
   }
   if (problems.length === 0) {
     console.log("ok: every note parses, every wikilink resolves, every supersedes chain and task is consistent");
@@ -514,6 +553,25 @@ function cmdDoctor(dir: string, fixAliases: boolean): void {
     console.log(`  ${path.basename(p.file)}: ${p.message}`);
   }
   process.exit(1);
+}
+
+function cmdMigrateFilenames(dir: string): void {
+  if (!fs.existsSync(dir)) fail(`no brain directory at ${dir} (run: cookbook-brain init)`);
+  const { renames, skipped } = migrateFilenames(dir);
+  if (renames.length === 0 && skipped.length === 0) {
+    console.log("cookbook-brain migrate-filenames: nothing to rename; every note file already matches its title");
+  } else {
+    console.log(`cookbook-brain migrate-filenames: renamed ${renames.length} file(s) in ${dir}`);
+    for (const r of renames) console.log(`  ${r.from} -> ${r.to}`);
+    for (const s of skipped) console.log(`  SKIPPED ${s.file}: ${s.reason}`);
+    console.log("Contents are byte-identical: these were plain renames, so git records them as renames.");
+  }
+  const indexFile = path.join(dir, INDEX_FILENAME);
+  if (fs.existsSync(indexFile)) {
+    fs.writeFileSync(indexFile, renderIndexMd(loadBrain(dir)));
+    console.log(`regenerated ${INDEX_FILENAME} (a view, not a note)`);
+  }
+  if (skipped.length > 0) process.exit(1);
 }
 
 function cmdIndex(dir: string): void {
@@ -1020,6 +1078,9 @@ async function main(): Promise<void> {
       break;
     case "doctor":
       cmdDoctor(args.dir, args.fixAliases);
+      break;
+    case "migrate-filenames":
+      cmdMigrateFilenames(args.dir);
       break;
     case "index":
       cmdIndex(args.dir);

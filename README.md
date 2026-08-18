@@ -26,6 +26,7 @@ npx cookbook-brain log           # recent notes, newest first
 npx cookbook-brain credit <id>   # credit notes whose facts held up in real work
 npx cookbook-brain tasks         # open and claimed tasks, with age
 npx cookbook-brain doctor        # validate every note, link, chain, and task
+npx cookbook-brain migrate-filenames  # rename pre-0.7.1 date-slug files to title filenames
 npx cookbook-brain index         # generate INDEX.md, a wikilinked view of the brain
 npx cookbook-brain web           # read-only local viewer at http://127.0.0.1:4321
 npx cookbook-brain install-hook  # every session harvests itself when it closes (report-only)
@@ -63,7 +64,7 @@ targets. 30s stays under every limit tested. Related:
 [[Unknown check state renders as degraded]]
 ```
 
-Notes are typed (`decision`, `gotcha`, `convention`, `note`, `open_thread`, `task`) and attributed to a human plus, when an agent wrote it, the agent's label. The optional `source` field cites where a fact comes from (a URL, a file path, a ticket id); cited memory is auditable memory, and it earns a higher confidence cap. Every note also carries an `aliases` list holding its own title; filenames are date-slugged, and that alias is what lets Obsidian resolve `[[Title]]` wikilinks to the right file (see "Using it with Obsidian" below). Wikilinks are the graph. Recall returns a note WITH its backlinks and the lines around each mention, so agents get connected context, not isolated facts. Recall also carries every active `convention` note verbatim, regardless of the query: standing rules ride along so agents apply them to all work, not just work that searched for them. Filenames are `<date>--<slug-of-title>.md`, so the directory reads like a journal.
+Notes are typed (`decision`, `gotcha`, `convention`, `note`, `open_thread`, `task`) and attributed to a human plus, when an agent wrote it, the agent's label. The optional `source` field cites where a fact comes from (a URL, a file path, a ticket id); cited memory is auditable memory, and it earns a higher confidence cap. Every note also carries an `aliases` list holding its own title, which feeds Obsidian autocomplete and search (see "Using it with Obsidian" below). Wikilinks are the graph. Recall returns a note WITH its backlinks and the lines around each mention, so agents get connected context, not isolated facts. Recall also carries every active `convention` note verbatim, regardless of the query: standing rules ride along so agents apply them to all work, not just work that searched for them. Filenames ARE the titles (`Poll interval is 30s, not 10.md`), which is what lets Obsidian resolve `[[Title]]` wikilinks natively, and the directory reads like a list of what your agents know.
 
 ## Never overwrite
 
@@ -208,15 +209,31 @@ Obsidian is where you read your brain. cookbook-brain is what keeps your agents 
 
 Open the brain directory (or any folder containing it) with Obsidian's "Open folder as vault". No plugins needed for the basics: wikilinks resolve, the graph view draws what your agents know, and backlinks just work.
 
-### Why the links resolve: aliases
+### Why the links resolve: filenames are the titles
 
-Filenames are date-slugged (`2026-08-18--poll-interval-is-30s.md`) but note bodies link by title (`[[Poll interval is 30s]]`). The bridge is the `aliases` frontmatter field: every note carries its own title as an alias, and Obsidian resolves wikilinks through aliases. Notes written by cookbook-brain 0.5 and earlier lack the field; `cookbook-brain doctor` warns about them, and
+Note bodies link by title (`[[Poll interval is 30s]]`), and every note's filename IS its title (`Poll interval is 30s.md`), so Obsidian resolves those links natively. This is not a stylistic choice: Obsidian resolves raw wikilinks by filename only. Frontmatter aliases power autocomplete and search, not link resolution (we proved this empirically before switching conventions), so any scheme with slugged filenames leaves every `[[Title]]` link as a ghost node in the graph.
+
+Titles are sanitized only where they must be: `/ \ : # ^ [ ] |` and control characters become hyphens; spaces, punctuation, and case survive. When two notes sanitize to the same filename, the newcomer gets a short id suffix like `Title (4x2xmc).md`. Every cookbook-brain tool still resolves that note by title, but a raw Obsidian `[[Title]]` click will land on the plain-named file, so `doctor` warns about suffixed files; retitle one of the pair if it bothers you. Titles that themselves contain characters like `:` can never match a filename in Obsidian, so keep titles filename-friendly.
+
+### Migrating a pre-0.7.1 brain
+
+Brains written before 0.7.1 have date-slug filenames (`2026-08-18--poll-interval-is-30s.md`), which Obsidian cannot resolve `[[Title]]` links to. One command fixes the whole directory:
+
+```
+npx cookbook-brain migrate-filenames
+```
+
+It renames every note file to the title convention with plain fs renames (git records renames; contents stay byte-identical), prints every `old -> new` pair, never overwrites (collisions get the id suffix), and regenerates `INDEX.md` if you have one. Reports and `harvested.json` under `dreams/` are logs, not notes, and are never touched.
+
+### Aliases: autocomplete and search
+
+Every note also carries its own title in the `aliases` frontmatter field, so Obsidian's autocomplete and quick switcher offer notes by title even mid-rename. Notes written by cookbook-brain 0.5 and earlier lack the field; `cookbook-brain doctor` warns about them, and
 
 ```
 npx cookbook-brain doctor --fix-aliases
 ```
 
-stamps `aliases: [<title>]` onto every active note missing it. That stamp is a sanctioned frontmatter addition, documented in SCHEMA.md alongside the supersede and credit stamps, and it never touches a body.
+backfills `aliases: [<title>]` onto every active note missing it. That stamp is a sanctioned frontmatter addition, documented in SCHEMA.md alongside the supersede and credit stamps, and it never touches a body.
 
 ### Properties view
 
