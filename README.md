@@ -92,7 +92,35 @@ Honest mechanics: there is no background process. Assignment means the note wait
 
 ## Dreaming
 
-`npx cookbook-brain dream` ships in the next release: a nightly consolidation pass that finds duplicates, proposes merges, promotes repeated gotchas toward conventions, and flags contradictions, with every proposal reviewed by an adversarial refuter before anything is applied. Applied changes will be supersede-only, so every dream stays reversible with git, and it will run on your own Claude CLI under your own login: cookbook-brain never holds an API key and makes no network calls of its own.
+Brains that only accumulate eventually silt up. `npx cookbook-brain dream` is the nightly consolidation pass: it merges duplicates, promotes twice-credited gotchas toward conventions, flags contradictions as open threads, and retitles colliding notes, with every proposal reviewed by an adversarial refuter before anything is applied. It runs on your own Claude CLI under your own login: cookbook-brain never holds an API key and makes no network calls of its own.
+
+```
+npx cookbook-brain dream               # report-only: propose and review, apply nothing
+npx cookbook-brain dream --apply       # execute the proposals the refuter kept
+npx cookbook-brain dream --dry-digest  # print exactly what would be sent to the model, then exit
+npx cookbook-brain dream --model <id>  # pick the model; default is your claude setting
+```
+
+How a dream works, in order:
+
+1. **Hygiene scan, no model.** A deterministic pass collects duplicate active titles, superseded notes still referenced by active wikilinks, and stale unproven notes (verify tier, older than 90 days). These findings seed the next step.
+2. **Proposer.** One `claude -p` call sees a compact digest of your active notes (id, type, title, credits, age, first 280 characters of each body) and may propose operations from a closed set only: merge, promote, flag_contradiction, retitle_for_collision. Run `--dry-digest` first if you want to read exactly what leaves for the model; the refuter call additionally sends the full text of any note a proposal touches.
+3. **Refuter.** A second `claude -p` call with fresh context and no memory of proposing reviews each proposal against the full text of its source notes, and must answer keep or reject with a reason. A proposal whose verdict cannot be parsed is rejected by default, never silently kept. If the refuter call itself fails or returns garbage, the whole dream is marked `refuter: absent` and nothing is applied, even with `--apply`. The report always distinguishes "no objections" from "the reviewer never showed".
+4. **Apply, only if you asked.** The default is report-only. With `--apply`, kept proposals execute reversibly: a merge writes one new note whose `consolidates` field lists the source ids and stamps each source `superseded_by`; a promotion does the same into a convention; a contradiction files an ordinary open_thread note; a retitle is a plain supersede. Undoing a dream is `git revert` on its commit, because a dream only ever adds files and stamps `superseded_by`.
+
+Every dream writes a report to `brain/dreams/DREAM_<date>.md` (a subdirectory the note scanner never reads): the digest stats, the hygiene findings, each proposal with its rationale, each refuter verdict with its reason, the mandatory `refuter: ran` or `refuter: absent` line, what was applied, and how to undo it.
+
+One property worth noticing: notes a dream writes are authored `{ human: you, agent: "dream" }`, and the bare-agent provenance cap applies. The brain distrusts its own dreams until work proves them. A dream-merged note starts at low confidence like any other uncited agent claim, and only earns its way up by being right when real work depends on it.
+
+### Nightly, if you want it
+
+Dreams are designed to run while you sleep. A plain crontab line does it:
+
+```
+15 3 * * * cd /path/to/your/project && npx cookbook-brain dream >> brain/dreams/cron.log 2>&1
+```
+
+Leave off `--apply` and read the reports over coffee, or add it once you trust your refuter's taste. Either way, commit the brain afterwards so every dream is one revertable commit.
 
 ## What it is not
 
