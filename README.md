@@ -26,6 +26,8 @@ npx cookbook-brain log           # recent notes, newest first
 npx cookbook-brain credit <id>   # credit notes whose facts held up in real work
 npx cookbook-brain tasks         # open and claimed tasks, with age
 npx cookbook-brain doctor        # validate every note, link, chain, and task
+npx cookbook-brain index         # generate INDEX.md, a wikilinked view of the brain
+npx cookbook-brain web           # read-only local viewer at http://127.0.0.1:4321
 ```
 
 The brain directory resolves as `--dir` flag, then the `BRAIN_DIR` environment variable, then `./brain`. Human attribution comes from `BRAIN_HUMAN`, falling back to your OS username. Requires Node 20 or newer.
@@ -45,6 +47,7 @@ One note per file. Frontmatter carries the facts about the fact:
 id: 01J8ZQ4X2E5N9GVHBK3W7T1MCD
 type: decision
 title: Poll interval is 30s, not 10
+aliases: ["Poll interval is 30s, not 10"]
 author:
   human: diego
   agent: claude-code
@@ -59,7 +62,7 @@ targets. 30s stays under every limit tested. Related:
 [[Unknown check state renders as degraded]]
 ```
 
-Notes are typed (`decision`, `gotcha`, `convention`, `note`, `open_thread`, `task`) and attributed to a human plus, when an agent wrote it, the agent's label. The optional `source` field cites where a fact comes from (a URL, a file path, a ticket id); cited memory is auditable memory, and it earns a higher confidence cap. Wikilinks are the graph. Recall returns a note WITH its backlinks and the lines around each mention, so agents get connected context, not isolated facts. Recall also carries every active `convention` note verbatim, regardless of the query: standing rules ride along so agents apply them to all work, not just work that searched for them. Filenames are `<date>--<slug-of-title>.md`, so the directory reads like a journal.
+Notes are typed (`decision`, `gotcha`, `convention`, `note`, `open_thread`, `task`) and attributed to a human plus, when an agent wrote it, the agent's label. The optional `source` field cites where a fact comes from (a URL, a file path, a ticket id); cited memory is auditable memory, and it earns a higher confidence cap. Every note also carries an `aliases` list holding its own title; filenames are date-slugged, and that alias is what lets Obsidian resolve `[[Title]]` wikilinks to the right file (see "Using it with Obsidian" below). Wikilinks are the graph. Recall returns a note WITH its backlinks and the lines around each mention, so agents get connected context, not isolated facts. Recall also carries every active `convention` note verbatim, regardless of the query: standing rules ride along so agents apply them to all work, not just work that searched for them. Filenames are `<date>--<slug-of-title>.md`, so the directory reads like a journal.
 
 ## Never overwrite
 
@@ -171,6 +174,82 @@ Your brain folder opens in Obsidian as a normal vault: the wikilinks light up, t
 So what does this add that an Obsidian vault plus one of the existing vault MCP servers does not? Those servers open a door: the agent can read, edit, and delete your notes. This tool adds the discipline for what walks through it. Vault servers let an agent overwrite your note; here, every change is a new attributed note superseding the old one. Vault notes are all equally trusted forever; here, notes carry provenance and earn confidence from outcomes. And a vault has no idea which of your agents wrote what or how they hand off work; here, that is the whole point.
 
 Obsidian is where you read your brain. cookbook-brain is what keeps your agents from wrecking it.
+
+## Using it with Obsidian
+
+### Open it as a vault
+
+Open the brain directory (or any folder containing it) with Obsidian's "Open folder as vault". No plugins needed for the basics: wikilinks resolve, the graph view draws what your agents know, and backlinks just work.
+
+### Why the links resolve: aliases
+
+Filenames are date-slugged (`2026-08-18--poll-interval-is-30s.md`) but note bodies link by title (`[[Poll interval is 30s]]`). The bridge is the `aliases` frontmatter field: every note carries its own title as an alias, and Obsidian resolves wikilinks through aliases. Notes written by cookbook-brain 0.5 and earlier lack the field; `cookbook-brain doctor` warns about them, and
+
+```
+npx cookbook-brain doctor --fix-aliases
+```
+
+stamps `aliases: [<title>]` onto every active note missing it. That stamp is a sanctioned frontmatter addition, documented in SCHEMA.md alongside the supersede and credit stamps, and it never touches a body.
+
+### Properties view
+
+Obsidian reads the frontmatter as properties: open any note and you see `type`, `author`, `created`, `credits`, `last_credited`, and on tasks `status`, `assigned_to`, `claimed_by`, `result`. That makes Obsidian search and the properties panel a free query surface over the brain's metadata.
+
+### The brain inside your vault
+
+Already keep a vault? Put the brain in a subfolder of it and point the tools there:
+
+```
+npx cookbook-brain init --dir ~/Vault/brain
+claude mcp add brain -- npx cookbook-brain serve --dir ~/Vault/brain
+```
+
+Your agents' memory then lives alongside your own notes, your vault notes can link into brain notes like any others, and `BRAIN_DIR` works the same way if you prefer an environment variable. The scanner only reads top-level `.md` files in that one folder, so the rest of your vault is never touched.
+
+### Hand-editing
+
+Your files, edit freely; the append-only discipline binds the agents' tools, not your hands. Fix a typo, reword a body, delete a note you never wanted: it is your brain. The never-overwrite rule exists so no AI quietly rewrites history, not to keep you out. After a bulk hand-edit, `cookbook-brain doctor` will tell you if anything broke a link, a supersede chain, or a task.
+
+### Dataview snippets
+
+These require the community Dataview plugin. Adjust `FROM "brain"` if your brain folder is named differently.
+
+All credited decisions (the closest frontmatter-only proxy for the proven tier; the exact tier math needs the confidence formula, which `web` shows):
+
+````
+```dataview
+TABLE credits, last_credited, author.agent AS agent
+FROM "brain"
+WHERE type = "decision" AND credits >= 1 AND !superseded_by
+SORT credits DESC
+```
+````
+
+Gotchas never credited (traps recorded but never yet confirmed by real work):
+
+````
+```dataview
+TABLE created, author.agent AS agent
+FROM "brain"
+WHERE type = "gotcha" AND credits = 0 AND !superseded_by
+SORT created ASC
+```
+````
+
+Open tasks by assignee:
+
+````
+```dataview
+TABLE assigned_to, abandon_reason, created
+FROM "brain"
+WHERE type = "task" AND status = "open" AND !superseded_by
+SORT assigned_to ASC
+```
+````
+
+### The homepage and the tier view
+
+`npx cookbook-brain index` generates `INDEX.md` at the brain root: every active note as a wikilink, grouped by type with conventions first, each with its tier and credits. It makes a good vault homepage; it is a view, not a note, so regenerating overwrites it and the scanner ignores it. And for the one thing Obsidian does not show, the live confidence and tier math, run `npx cookbook-brain web`: a read-only viewer at `http://127.0.0.1:4321` with confidence bars, tier badges, the task board, and the dream and harvest reports.
 
 ## Acknowledgments and the honest map
 

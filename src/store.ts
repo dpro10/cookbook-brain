@@ -31,6 +31,14 @@ export interface Note {
   id: string;
   type: NoteType;
   title: string;
+  /**
+   * Obsidian aliases, always carrying the note's title. Filenames are
+   * date-slugged, so Obsidian resolves [[Title]] wikilinks through this
+   * field. Emitted on every new note; older notes may lack it (doctor warns,
+   * and `doctor --fix-aliases` stamps it in place as a sanctioned
+   * frontmatter addition).
+   */
+  aliases?: string[];
   author: Author;
   created: string;
   supersedes: string | null;
@@ -149,14 +157,45 @@ function parseScalar(raw: string): string | null {
   return s;
 }
 
+/** A list item for frontmatter: like fmScalar, but commas also force quoting so the list splitter can round-trip it. */
+function fmListItem(value: string): string {
+  const bare = fmScalar(value);
+  if (value.includes(",") && !bare.startsWith('"')) return JSON.stringify(value);
+  return bare;
+}
+
+/** Split a bracketed list's inner text on commas, respecting double-quoted items (which may contain commas). */
+function splitListInner(inner: string): string[] {
+  const parts: string[] = [];
+  let current = "";
+  let inQuotes = false;
+  for (let i = 0; i < inner.length; i++) {
+    const ch = inner[i];
+    if (inQuotes) {
+      current += ch;
+      if (ch === "\\" && i + 1 < inner.length) current += inner[++i];
+      else if (ch === '"') inQuotes = false;
+    } else if (ch === '"') {
+      current += ch;
+      inQuotes = true;
+    } else if (ch === ",") {
+      parts.push(current);
+      current = "";
+    } else {
+      current += ch;
+    }
+  }
+  parts.push(current);
+  return parts;
+}
+
 /** Parse a `[a, b, c]` frontmatter list. Returns null when the value is not bracketed. */
 function parseList(raw: string): string[] | null {
   const s = raw.trim();
   if (!s.startsWith("[") || !s.endsWith("]")) return null;
   const inner = s.slice(1, -1).trim();
   if (inner === "") return [];
-  return inner
-    .split(",")
+  return splitListInner(inner)
     .map((part) => parseScalar(part) ?? "")
     .filter((v) => v !== "");
 }
@@ -167,12 +206,15 @@ export function serializeNote(note: Omit<Note, "file">): string {
     `id: ${fmScalar(note.id)}`,
     `type: ${note.type}`,
     `title: ${fmScalar(note.title)}`,
+  ];
+  if (note.aliases !== undefined) lines.push(`aliases: [${note.aliases.map(fmListItem).join(", ")}]`);
+  lines.push(
     "author:",
     `  human: ${fmScalar(note.author.human)}`,
     `  agent: ${fmScalar(note.author.agent)}`,
     `created: ${note.created}`,
     `supersedes: ${fmScalar(note.supersedes)}`,
-  ];
+  );
   if (note.source !== undefined) lines.push(`source: ${fmScalar(note.source)}`);
   if (note.consolidates !== undefined) lines.push(`consolidates: [${note.consolidates.map(fmScalar).join(", ")}]`);
   if (note.superseded_by !== undefined) lines.push(`superseded_by: ${fmScalar(note.superseded_by)}`);
@@ -238,6 +280,12 @@ export function parseNoteFile(file: string, content: string): ParsedFile {
   }
   const title = get("title");
   if (!title) problems.push("missing title");
+  let aliases: string[] | undefined;
+  if (fields.has("aliases")) {
+    const list = parseList(fields.get("aliases")!);
+    if (list === null) problems.push(`aliases is not a [bracketed] list: ${fields.get("aliases")!.trim()}`);
+    else aliases = list;
+  }
   const human = get("author.human");
   if (human === undefined) problems.push("missing author.human");
   const agent = fields.has("author.agent") ? get("author.agent") : undefined;
@@ -315,6 +363,7 @@ export function parseNoteFile(file: string, content: string): ParsedFile {
       .replace(/\s+$/, ""),
     file,
   };
+  if (aliases !== undefined) note.aliases = aliases;
   if (source !== undefined) note.source = source;
   if (supersededBy != null) note.superseded_by = supersededBy;
   if (consolidates !== undefined) note.consolidates = consolidates;
@@ -346,12 +395,12 @@ export function noteFilename(created: string, title: string): string {
 
 // ---- scanning ----
 
-/** Files in the brain dir that are notes: every top-level .md except SCHEMA.md and README.md. */
+/** Files in the brain dir that are notes: every top-level .md except SCHEMA.md, README.md, and the generated INDEX.md view. */
 export function listNoteFiles(dir: string): string[] {
   if (!fs.existsSync(dir)) return [];
   return fs
     .readdirSync(dir)
-    .filter((f) => f.endsWith(".md") && f !== "SCHEMA.md" && f !== "README.md")
+    .filter((f) => f.endsWith(".md") && f !== "SCHEMA.md" && f !== "README.md" && f !== INDEX_FILENAME)
     .sort()
     .map((f) => path.join(dir, f));
 }
@@ -424,6 +473,8 @@ export function createNote(dir: string, input: CreateInput): Note {
     id: input.id ?? ulid(),
     type: input.type,
     title: input.title.trim(),
+    // Obsidian resolves [[Title]] links via aliases, since filenames are date-slugged
+    aliases: [input.title.trim()],
     author: input.author,
     created,
     supersedes: input.supersedes ?? null,
@@ -453,10 +504,11 @@ export function createNote(dir: string, input: CreateInput): Note {
 
 /**
  * Rewrite one existing note file with stamped frontmatter. Bodies are
- * append-only forever; this helper exists only for the three sanctioned
- * in-place stamps: superseded_by, the credit counters (credits +
- * last_credited), and the task lifecycle fields (status, claimed_by, result,
- * abandon_reason) on task-type notes.
+ * append-only forever; this helper exists only for the sanctioned in-place
+ * stamps: superseded_by, the credit counters (credits + last_credited), the
+ * task lifecycle fields (status, claimed_by, result, abandon_reason) on
+ * task-type notes, and the title alias stamp doctor --fix-aliases applies to
+ * pre-alias notes.
  */
 function stampNote(note: Note): Note {
   const { file: _f, ...rest } = note;
@@ -932,6 +984,100 @@ export function diagnose(dir: string): BrainProblem[] {
     }
   }
   return problems;
+}
+
+// ---- index view ----
+
+/**
+ * The generated INDEX.md view at the brain root. It is a VIEW, not a note:
+ * `cookbook-brain index` overwrites it wholesale on every run, and the note
+ * scanner excludes it by name, the same mechanism that excludes SCHEMA.md.
+ */
+export const INDEX_FILENAME = "INDEX.md";
+
+const INDEX_SECTIONS: { type: NoteType; heading: string }[] = [
+  { type: "convention", heading: "Conventions" },
+  { type: "decision", heading: "Decisions" },
+  { type: "gotcha", heading: "Gotchas" },
+  { type: "open_thread", heading: "Open threads" },
+  { type: "note", heading: "Notes" },
+  { type: "task", heading: "Tasks" },
+];
+
+/**
+ * Render the INDEX.md view: conventions first (standing rules lead), then
+ * decisions, gotchas, open threads, notes, and waiting tasks. Every entry is
+ * the note's verbatim title as a [[wikilink]] with its tier and credits
+ * (tasks show status and assignee instead). Ordering is deterministic: the
+ * fixed section order, then created descending, ties broken by id, so
+ * regenerating an unchanged brain is byte-identical.
+ */
+export function renderIndexMd(brain: Brain, now: number = Date.now()): string {
+  const lines: string[] = [
+    "# Brain index",
+    "",
+    "A generated view of this brain's active notes, one [[wikilink]] per note.",
+    "Regenerating with `cookbook-brain index` overwrites this file: it is a view,",
+    "not a note, and the note scanner ignores it (like SCHEMA.md).",
+    "",
+  ];
+  const byCreatedDesc = (a: Note, b: Note) =>
+    a.created > b.created ? -1 : a.created < b.created ? 1 : a.id > b.id ? -1 : 1;
+  for (const { type, heading } of INDEX_SECTIONS) {
+    lines.push(`## ${heading}`, "");
+    let section = activeNotes(brain).filter((n) => n.type === type);
+    if (type === "task") section = section.filter((n) => n.status !== "done");
+    section = [...section].sort(byCreatedDesc);
+    if (section.length === 0) {
+      lines.push("- none", "");
+      continue;
+    }
+    for (const n of section) {
+      if (type === "task") {
+        const who =
+          n.status === "claimed"
+            ? `claimed by ${n.claimed_by}`
+            : n.assigned_to
+              ? `open, for ${n.assigned_to}`
+              : "open, for any agent";
+        lines.push(`- [[${n.title}]] (${who})`);
+      } else {
+        const confidence = confidenceFor(n, now);
+        const tier = tierFor(confidence, n.credits);
+        lines.push(`- [[${n.title}]] (${tier}, ${n.credits} credit${n.credits === 1 ? "" : "s"})`);
+      }
+    }
+    lines.push("");
+  }
+  return lines.join("\n");
+}
+
+// ---- Obsidian aliases ----
+
+/** True when the note's aliases include its own title (case-insensitive), so Obsidian [[Title]] links resolve to it. */
+export function hasTitleAlias(note: Note): boolean {
+  return (note.aliases ?? []).some((a) => a.trim().toLowerCase() === note.title.toLowerCase());
+}
+
+/**
+ * Active notes missing an alias matching their title. Doctor warns about
+ * these (Obsidian cannot resolve [[Title]] wikilinks to a date-slugged
+ * filename without the alias); `doctor --fix-aliases` stamps them.
+ */
+export function missingTitleAlias(brain: Brain): Note[] {
+  return activeNotes(brain).filter((n) => !hasTitleAlias(n));
+}
+
+/**
+ * Stamp a title alias onto every active note that lacks one, in place. This
+ * is a sanctioned frontmatter addition (like the superseded_by and credit
+ * stamps): it adds `aliases: [<title>]` (or appends the title to an existing
+ * aliases list) and never touches a body or any other field. Returns the
+ * stamped notes.
+ */
+export function fixTitleAliases(dir: string): Note[] {
+  const brain = loadBrain(dir);
+  return missingTitleAlias(brain).map((note) => stampNote({ ...note, aliases: [...(note.aliases ?? []), note.title] }));
 }
 
 // ---- brain lock ----

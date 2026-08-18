@@ -16,6 +16,10 @@ import path from "node:path";
 import {
   LOCK_STALE_MS,
   abandonTask,
+  fixTitleAliases,
+  hasTitleAlias,
+  missingTitleAlias,
+  renderIndexMd,
   acquireLock,
   activeConventions,
   activeLock,
@@ -69,6 +73,7 @@ import {
   type HarvestProposal,
   type ScannedSession,
 } from "../src/harvest.ts";
+import { serveWeb } from "../src/web.ts";
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 const BASIC = path.join(ROOT, "test", "fixtures", "basic-brain");
@@ -2723,6 +2728,337 @@ check("cli harvest --apply: a fresh foreign lock means nothing is written and th
 });
 
 fs.rmSync(harvestShimDir, { recursive: true, force: true });
+
+// ---- v0.6: Obsidian aliases ----
+
+check("aliases: createNote, supersede, and assign_task all emit aliases: [<title>], and it round-trips from disk", () => {
+  const dir = tmpdir("brain-alias-");
+  try {
+    const author = { human: "diego", agent: "claude-code" };
+    const note = createNote(dir, { type: "gotcha", title: "Cache rules", body: "x", author });
+    assert.deepEqual(note.aliases, ["Cache rules"], "createNote must stamp the title as an alias");
+    assert.ok(fs.readFileSync(note.file, "utf8").includes("aliases: [Cache rules]"), "the alias must land in frontmatter");
+    const reread = parseNoteFile(note.file, fs.readFileSync(note.file, "utf8")).note!;
+    assert.deepEqual(reread.aliases, ["Cache rules"], "the alias must round-trip through the parser");
+    assert.ok(hasTitleAlias(reread));
+    assert.ok(hasTitleAlias({ ...reread, aliases: ["CACHE RULES"] }), "title aliases match case-insensitively");
+    const { newNote } = supersedeNote(dir, note.id, { type: "gotcha", title: "Cache rules v2", body: "y", author });
+    assert.deepEqual(newNote.aliases, ["Cache rules v2"], "supersede replacements carry their own title alias");
+    const task = assignTask(dir, { title: "Draft the FAQ", instructions: "z", author });
+    assert.deepEqual(task.aliases, ["Draft the FAQ"], "task notes carry the alias too");
+    assert.deepEqual(missingTitleAlias(loadBrain(dir)), [], "a fresh 0.6 brain has no alias gaps");
+    assert.deepEqual(diagnose(dir), [], "aliases must not disturb the validator");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+check("aliases: round-trip survives commas, colons, and brackets in titles; malformed aliases is a parse problem", () => {
+  const note: Omit<Note, "file"> = {
+    id: ulid(),
+    type: "note",
+    title: "Routing: app, not pages",
+    aliases: ["Routing: app, not pages", "plain extra alias"],
+    author: { human: "diego", agent: null },
+    created: "2026-08-18T10:00:00.000Z",
+    supersedes: null,
+    credits: 0,
+    last_credited: null,
+    body: "b",
+  };
+  const parsed = parseNoteFile("x.md", serializeNote(note));
+  assert.deepEqual(parsed.problems, []);
+  const { file: _f, ...roundTripped } = parsed.note!;
+  assert.deepEqual(roundTripped, note, "quoted list items with commas must split correctly");
+  const dir = tmpdir("brain-alias-tricky-");
+  try {
+    const written = createNote(dir, { type: "note", title: "Weird, title: with [brackets]", body: "x", author: { human: "d", agent: null } });
+    const reread = parseNoteFile(written.file, fs.readFileSync(written.file, "utf8")).note!;
+    assert.deepEqual(reread.aliases, ["Weird, title: with [brackets]"], "tricky titles must survive the disk round-trip");
+    assert.ok(hasTitleAlias(reread));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+  const withoutAliases = serializeNote({ ...note, aliases: undefined });
+  const malformed = withoutAliases.replace("supersedes: null", "supersedes: null\naliases: not-a-list");
+  assert.ok(
+    parseNoteFile("x.md", malformed).problems.some((p) => p.includes("bracketed")),
+    "an unbracketed aliases value must be reported, not crash",
+  );
+  assert.equal(parseNoteFile("x.md", withoutAliases).note!.aliases, undefined, "pre-alias notes still parse clean");
+});
+
+check("aliases: doctor warns on pre-alias active notes (exit 0), --fix-aliases stamps them, superseded notes never warn", () => {
+  const dir = tmpdir("brain-alias-fix-");
+  try {
+    const author = { human: "diego", agent: null };
+    // a pre-alias active note, as written by cookbook-brain 0.5 and earlier
+    fs.writeFileSync(
+      path.join(dir, "2026-08-01--old-note.md"),
+      serializeNote({
+        id: "01J8F000000000000000000001",
+        type: "note",
+        title: "Old note",
+        author,
+        created: "2026-08-01T10:00:00.000Z",
+        supersedes: null,
+        credits: 2,
+        last_credited: null,
+        body: "kept body",
+      }),
+    );
+    // a consistent pre-alias supersede pair: the superseded half must NOT warn
+    fs.writeFileSync(
+      path.join(dir, "2026-08-02--old-b.md"),
+      serializeNote({
+        id: "01J8F000000000000000000002",
+        type: "note",
+        title: "Old B",
+        author,
+        created: "2026-08-02T10:00:00.000Z",
+        supersedes: null,
+        superseded_by: "01J8F000000000000000000003",
+        credits: 0,
+        last_credited: null,
+        body: "b",
+      }),
+    );
+    fs.writeFileSync(
+      path.join(dir, "2026-08-03--new-b.md"),
+      serializeNote({
+        id: "01J8F000000000000000000003",
+        type: "note",
+        title: "New B",
+        aliases: ["New B"],
+        author,
+        created: "2026-08-03T10:00:00.000Z",
+        supersedes: "01J8F000000000000000000002",
+        credits: 0,
+        last_credited: null,
+        body: "b2",
+      }),
+    );
+    assert.deepEqual(
+      missingTitleAlias(loadBrain(dir)).map((n) => n.title),
+      ["Old note"],
+      "only the pre-alias ACTIVE note may warn",
+    );
+    const warn = runCli(["doctor", "--dir", dir]);
+    assert.equal(warn.status, 0, "alias gaps are warnings, not errors: doctor must still exit 0");
+    assert.ok(warn.stdout.includes("1 alias warning(s)"), warn.stdout);
+    assert.ok(warn.stdout.includes('no alias matching "Old note"'), warn.stdout);
+    assert.ok(warn.stdout.includes("--fix-aliases"), "the warning must teach the fix");
+    assert.ok(warn.stdout.includes("ok: every note parses"), "warnings must not hide the ok line");
+    const fix = runCli(["doctor", "--fix-aliases", "--dir", dir]);
+    assert.equal(fix.status, 0, fix.stderr);
+    assert.ok(fix.stdout.includes("stamped a title alias onto 1 note(s)"), fix.stdout);
+    assert.ok(!fix.stdout.includes("alias warning"), "after the fix there is nothing left to warn about");
+    const fixed = parseNoteFile("x.md", fs.readFileSync(path.join(dir, "2026-08-01--old-note.md"), "utf8")).note!;
+    assert.deepEqual(fixed.aliases, ["Old note"], "the stamp must land on disk");
+    assert.equal(fixed.body, "kept body", "the alias stamp must never touch a body");
+    assert.equal(fixed.credits, 2, "the alias stamp must not disturb other fields");
+    assert.deepEqual(fixTitleAliases(dir), [], "a second fix has nothing to do");
+    // an existing aliases list gains the title, it is not replaced
+    fs.writeFileSync(
+      path.join(dir, "2026-08-04--aliased.md"),
+      serializeNote({
+        id: "01J8F000000000000000000004",
+        type: "note",
+        title: "Custom aliased",
+        aliases: ["shorthand"],
+        author,
+        created: "2026-08-04T10:00:00.000Z",
+        supersedes: null,
+        credits: 0,
+        last_credited: null,
+        body: "c",
+      }),
+    );
+    const stamped = fixTitleAliases(dir);
+    assert.equal(stamped.length, 1);
+    assert.deepEqual(stamped[0].aliases, ["shorthand", "Custom aliased"], "hand-added aliases survive the stamp");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- v0.6: the INDEX.md view ----
+
+/** A brain with one of everything for the index and web tests. */
+function seedViewBrain(dir: string): void {
+  const human = { human: "diego", agent: null };
+  const agent = { human: "diego", agent: "claude-code" };
+  const at = (day: number) => {
+    const created = daysAgo(day);
+    return { created, id: ulid(Date.parse(created)) };
+  };
+  createNote(dir, { type: "convention", title: "No em dashes in copy", body: "Restructure the sentence instead.", author: human, ...at(9) });
+  const poll = createNote(dir, { type: "decision", title: "Poll interval is 30s", body: "Free tiers rate limit below that.", author: human, ...at(4) });
+  creditNotes(dir, [poll.id]);
+  createNote(dir, { type: "decision", title: "Older decision", body: "still holds", author: human, ...at(6) });
+  const gotcha = createNote(dir, { type: "gotcha", title: "Registry mirrors lag", body: "Fresh publishes 404 for a day.\n\nsource: https://example.com/registry", author: agent, ...at(3) });
+  creditNotes(dir, [gotcha.id]);
+  createNote(dir, { type: "note", title: "Linked note", body: "See [[Registry mirrors lag]] before publishing.", author: human, ...at(2) });
+  const retired = createNote(dir, { type: "note", title: "Retired fact", body: "was true", author: human, ...at(8) });
+  supersedeNote(dir, retired.id, { type: "note", title: "Current fact", body: "is true", author: human, ...at(7) });
+  const forCodex = assignTask(dir, { title: "Open work", instructions: "do the open thing", assigned_to: "codex", author: agent, ...at(5) });
+  claimTask(dir, forCodex.id, "codex");
+  abandonTask(dir, forCodex.id, "no prod access on this machine", "codex");
+  const claimed = assignTask(dir, { title: "Claimed work", instructions: "in flight", author: agent, ...at(4) });
+  claimTask(dir, claimed.id, "gemini");
+  const done = assignTask(dir, { title: "Done work", instructions: "finished", author: agent, ...at(3) });
+  completeTask(dir, done.id, "shipped in docs/out.md", "codex");
+}
+
+check("cli index: INDEX.md is a wikilinked view with ordered sections, tiers, credits, and task statuses", () => {
+  const dir = tmpdir("brain-index-");
+  try {
+    seedViewBrain(dir);
+    const notesBefore = loadBrain(dir).notes.length;
+    const r = runCli(["index", "--dir", dir]);
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(r.stdout.includes("wrote"), r.stdout);
+    assert.ok(r.stdout.includes("a view, not a note"), "the CLI must say the file is a view");
+    const file = path.join(dir, "INDEX.md");
+    const text = fs.readFileSync(file, "utf8");
+    const order = ["## Conventions", "## Decisions", "## Gotchas", "## Open threads", "## Notes", "## Tasks"];
+    let last = -1;
+    for (const heading of order) {
+      const pos = text.indexOf(heading);
+      assert.ok(pos !== -1, `INDEX.md must carry section: ${heading}`);
+      assert.ok(pos > last, `sections must appear in order; ${heading} is misplaced`);
+      last = pos;
+    }
+    assert.ok(text.includes("- [[No em dashes in copy]] (standing, 0 credits)"), text);
+    assert.ok(text.includes("- [[Poll interval is 30s]] (proven, 1 credit)"), "a credited human note reads proven with singular credit");
+    assert.ok(text.includes("- [[Registry mirrors lag]] (proven, 1 credit)"), text);
+    assert.ok(
+      text.indexOf("[[Poll interval is 30s]]") < text.indexOf("[[Older decision]]"),
+      "within a section, newest created first",
+    );
+    assert.ok(text.includes("- [[Open work]] (open, for codex)"), "open tasks show their assignee");
+    assert.ok(text.includes("- [[Claimed work]] (claimed by gemini)"), "claimed tasks show their claimer");
+    assert.ok(!text.includes("[[Done work]]"), "done tasks leave the index");
+    assert.ok(!text.includes("[[Retired fact]]"), "superseded notes leave the index");
+    assert.ok(text.includes("[[Current fact]]"), "their successors stay");
+    assert.ok(text.includes("it is a view"), "the file must explain that regenerating overwrites it");
+    // exclusion: INDEX.md is not a note, does not enter recall, and does not disturb doctor
+    const brain = loadBrain(dir);
+    assert.equal(brain.notes.length, notesBefore, "INDEX.md must not be scanned as a note");
+    assert.ok(!brain.notes.some((n) => n.file.endsWith("INDEX.md")));
+    assert.deepEqual(recall(brain, { query: "Brain index" }), [], "the view must never surface in recall");
+    assert.equal(runCli(["doctor", "--dir", dir]).status, 0, "the generated view must not create doctor problems");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+check("index: deterministic for a fixed brain and clock, and regenerating overwrites the view in place", () => {
+  const dir = tmpdir("brain-index-det-");
+  try {
+    seedViewBrain(dir);
+    const one = renderIndexMd(loadBrain(dir), NOW);
+    const two = renderIndexMd(loadBrain(dir), NOW);
+    assert.equal(one, two, "same brain and clock must produce byte-identical views");
+    assert.equal(runCli(["index", "--dir", dir]).status, 0);
+    const first = fs.readFileSync(path.join(dir, "INDEX.md"), "utf8");
+    assert.equal(runCli(["index", "--dir", dir]).status, 0);
+    const second = fs.readFileSync(path.join(dir, "INDEX.md"), "utf8");
+    assert.equal(first, second, "regenerating an unchanged brain must be byte-identical");
+    createNote(dir, { type: "note", title: "Brand new note", body: "fresh", author: { human: "diego", agent: null } });
+    assert.equal(runCli(["index", "--dir", dir]).status, 0);
+    const third = fs.readFileSync(path.join(dir, "INDEX.md"), "utf8");
+    assert.ok(third.includes("[[Brand new note]]"), "regenerating must pick up new notes by overwriting the view");
+    assert.equal(fs.readdirSync(dir).filter((f) => f === "INDEX.md").length, 1, "there is only ever one INDEX.md");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- v0.6: the read-only web viewer ----
+
+check("cli web: --port validates and a missing brain dir refuses with guidance", () => {
+  assert.equal(runCli(["web", "--port", "abc"]).status, 2, "--port must require an integer");
+  assert.equal(runCli(["web", "--port", "99999"]).status, 2, "--port must stay in range");
+  const r = runCli(["web", "--dir", path.join(os.tmpdir(), "definitely-missing-brain")]);
+  assert.equal(r.status, 2);
+  assert.ok(r.stderr.includes("cookbook-brain init"), r.stderr);
+});
+
+async function webViewerTest(): Promise<void> {
+  const dir = tmpdir("brain-web-");
+  let server: Awaited<ReturnType<typeof serveWeb>> | null = null;
+  try {
+    seedViewBrain(dir);
+    fs.mkdirSync(path.join(dir, "dreams"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "dreams", "DREAM_2026-08-17.md"), "# Dream report\n\nrefuter: ran\n");
+    server = await serveWeb(dir, 0);
+    const addr = server.address() as { address: string; port: number };
+    const base = `http://127.0.0.1:${addr.port}`;
+
+    await checkAsync("web: binds 127.0.0.1 only", async () => {
+      assert.equal(addr.address, "127.0.0.1", "the viewer must never bind a public interface");
+    });
+
+    await checkAsync("web: serves one self-contained page with the section structure and the read-only footer", async () => {
+      const res = await fetch(`${base}/`);
+      assert.equal(res.status, 200);
+      assert.ok((res.headers.get("content-type") ?? "").includes("text/html"));
+      const html = await res.text();
+      assert.ok(html.includes("Read-only view. The live multiplayer version is cookbook.team"), "the footer line must be present verbatim");
+      for (const heading of ["<h2>Conventions</h2>", "<h2>Notes</h2>", "<h2>Task board</h2>", "<h2>Reports</h2>"]) {
+        assert.ok(html.includes(heading), `the page must carry ${heading}`);
+      }
+      assert.ok(html.includes("/api/brain.json"), "the page must fetch the JSON endpoint");
+      assert.ok(!/src\s*=\s*["']https?:/i.test(html), "no external scripts: the page is self-contained");
+      assert.ok(!/href\s*=\s*["']https?:[^"']*\.css/i.test(html), "no CDN stylesheets");
+    });
+
+    await checkAsync("web: /api/brain.json carries confidence, tier, credits, backlinks, tasks, conventions, and reports", async () => {
+      const res = await fetch(`${base}/api/brain.json`);
+      assert.equal(res.status, 200);
+      assert.ok((res.headers.get("content-type") ?? "").includes("application/json"));
+      const data = await res.json();
+      assert.equal(data.brain, dir);
+      const gotcha = data.notes.find((n: any) => n.title === "Registry mirrors lag");
+      assert.ok(gotcha, "active notes must be present");
+      assert.equal(typeof gotcha.confidence, "number", "every note carries a confidence score");
+      assert.equal(gotcha.tier, "proven", "a fresh credited sourced-agent note reads proven at 0.80");
+      assert.equal(gotcha.credits, 1);
+      assert.deepEqual(gotcha.backlinks.map((b: any) => b.title), ["Linked note"], "backlinks ride the JSON");
+      assert.ok(!data.notes.some((n: any) => n.title === "Retired fact"), "superseded notes stay out");
+      assert.deepEqual(data.conventions.map((c: any) => c.title), ["No em dashes in copy"], "conventions ride separately for pinning");
+      assert.equal(typeof data.conventions[0].tier, "string");
+      const open = data.tasks.find((t: any) => t.title === "Open work");
+      assert.equal(open.status, "open");
+      assert.equal(open.abandon_reason, "no prod access on this machine", "abandon reasons must be visible on the board");
+      assert.equal(data.tasks.find((t: any) => t.title === "Claimed work").claimed_by, "gemini");
+      assert.equal(data.tasks.find((t: any) => t.title === "Done work").result, "shipped in docs/out.md");
+      assert.equal(data.reports.length, 1);
+      assert.equal(data.reports[0].name, "DREAM_2026-08-17.md");
+      assert.ok(data.reports[0].content.includes("refuter: ran"), "report contents ride the JSON");
+    });
+
+    await checkAsync("web: read-only means 405 on every non-GET, 404 on unknown paths, and zero disk changes", async () => {
+      const before = fs.readdirSync(dir).sort().join(",");
+      for (const method of ["POST", "PUT", "DELETE", "PATCH"]) {
+        for (const p of ["/", "/api/brain.json", "/api/remember"]) {
+          const res = await fetch(base + p, { method, body: method === "POST" || method === "PUT" ? "{}" : undefined });
+          assert.equal(res.status, 405, `${method} ${p} must be refused with 405`);
+          assert.equal(res.headers.get("allow"), "GET, HEAD");
+        }
+      }
+      const missing = await fetch(`${base}/api/notes`);
+      assert.equal(missing.status, 404, "unknown paths are 404: only / and /api/brain.json exist");
+      assert.equal(fs.readdirSync(dir).sort().join(","), before, "no request may change the brain directory");
+    });
+  } finally {
+    server?.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+await webViewerTest();
 
 if (failures > 0) {
   console.error(`\n${failures} test(s) FAILED`);

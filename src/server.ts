@@ -90,7 +90,7 @@ const sourceField = z
   );
 
 export function buildServer(dir: string, env: NodeJS.ProcessEnv = process.env): McpServer {
-  const server = new McpServer({ name: "cookbook-brain", version: "0.4.0" });
+  const server = new McpServer({ name: "cookbook-brain", version: "0.6.0" });
 
   server.registerTool(
     "remember",

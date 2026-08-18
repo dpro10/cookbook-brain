@@ -8,6 +8,9 @@
  *   credit   credit notes that proved true in completed work
  *   tasks    list open and claimed tasks with their age
  *   doctor   validate every note and the link/supersede graph
+ *            (--fix-aliases stamps title aliases onto pre-alias notes)
+ *   index    generate the INDEX.md view at the brain root
+ *   web      serve the read-only local viewer on 127.0.0.1
  *   dream    offline consolidation: propose, refute, and (with --apply) apply
  *   harvest  bootstrap memory from local Claude Code transcripts: digest,
  *            propose, refute, and (with --apply) write new notes
@@ -19,13 +22,17 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import {
+  INDEX_FILENAME,
   activeNotes,
   confidenceFor,
   creditNotes,
   diagnose,
+  fixTitleAliases,
   humanName,
   listTasks,
   loadBrain,
+  missingTitleAlias,
+  renderIndexMd,
   tierFor,
   type Note,
 } from "./store.ts";
@@ -41,6 +48,11 @@ Commands:
   credit <id...>  credit notes whose facts held up in completed work
   tasks           list open and claimed tasks with their age
   doctor          validate every note, wikilink, supersedes chain, and task
+  index           generate INDEX.md at the brain root: every active note as a
+                  [[wikilink]] with its tier and credits, conventions first
+                  (a view, not a note: regenerating overwrites it)
+  web             serve a read-only local viewer at http://127.0.0.1:4321
+                  (one page, no frameworks; localhost only, GET only)
   dream           consolidate overnight: merge duplicates, promote proven
                   gotchas, flag contradictions; an adversarial refuter reviews
                   every proposal; report-only unless --apply
@@ -50,6 +62,9 @@ Commands:
 
 Options:
   --dir <path>   brain directory (default ./brain; BRAIN_DIR env also works)
+  --fix-aliases  doctor: stamp a title alias onto active notes missing one, so
+                 Obsidian resolves [[Title]] wikilinks (a sanctioned stamp)
+  --port <n>     web: port for the read-only viewer (default 4321)
   --apply        dream/harvest: execute proposals the refuter kept (default: report-only)
   --commit       dream: after a successful apply, git commit the brain directory
                  (only paths under it); requires --apply and a git repo
@@ -82,6 +97,7 @@ A note is a small frontmatter block followed by a markdown body:
 id: 01J8ZQ4X2E5N9GVHBK3W7T1MCD
 type: gotcha
 title: Vercel strips trailing slashes on rewrites
+aliases: [Vercel strips trailing slashes on rewrites]
 author:
   human: diego
   agent: Claude Code
@@ -103,6 +119,11 @@ The fields:
 - **type**: one of \`decision\`, \`gotcha\`, \`convention\`, \`note\`,
   \`open_thread\`, \`task\`.
 - **title**: short and stable. Other notes link to it by title.
+- **aliases**: a list that always carries the note's title. Filenames are
+  date-slugged, so Obsidian resolves \`[[Title]]\` wikilinks through this
+  field. Every new note gets it automatically; older notes can be stamped
+  with \`cookbook-brain doctor --fix-aliases\` (a sanctioned frontmatter
+  addition, see below).
 - **author.human**: the person this note is attributed to.
 - **author.agent**: the agent that wrote it, or \`null\` if the human wrote it
   themselves.
@@ -173,8 +194,11 @@ note verifiably completed. That credit pair is the second sanctioned
 mutation of an existing file, alongside the \`superseded_by\` stamp described
 above. Task notes allow a third stamp set, on task-type notes only:
 \`status\`, \`claimed_by\`, \`result\`, and \`abandon_reason\`, which move a
-task through its lifecycle. Nothing else about an existing file is ever
-touched, and no stamp ever changes a body.
+task through its lifecycle. One more sanctioned addition exists for notes
+written before aliases did: \`cookbook-brain doctor --fix-aliases\` stamps
+\`aliases: [<title>]\` onto an active note missing it, so Obsidian wikilinks
+resolve. Nothing else about an existing file is ever touched, and no stamp
+ever changes a body.
 
 Superseded notes are excluded from recall by default.
 
@@ -206,6 +230,14 @@ detection. The brain trusts its own bootstrap more than a bare claim, but
 less than you. Harvest reports live in the \`dreams/\` subdirectory as
 \`HARVEST_<date>.md\`.
 
+## The generated index
+
+\`cookbook-brain index\` writes an INDEX.md file at this directory's root:
+every active note as a \`[[wikilink]]\` with its tier and credits, grouped by
+type with conventions first. INDEX.md is a VIEW, not a note: regenerating
+overwrites it wholesale, and the note scanner ignores it by name, exactly
+like this SCHEMA.md. Point Obsidian at it as the vault homepage.
+
 ## Git
 
 Commit this directory. It is designed to be versioned with the project it
@@ -229,6 +261,10 @@ interface Args {
   sessions?: string;
   days: number;
   project?: string;
+  /** doctor only */
+  fixAliases: boolean;
+  /** web only */
+  port: number;
 }
 
 function fail(msg: string): never {
@@ -238,7 +274,7 @@ function fail(msg: string): never {
 }
 
 function parseArgs(argv: string[]): Args {
-  const args: Args = { command: null, rest: [], dir: "", limit: 20, apply: false, commit: false, json: false, dryDigest: false, days: 7 };
+  const args: Args = { command: null, rest: [], dir: "", limit: 20, apply: false, commit: false, json: false, dryDigest: false, days: 7, fixAliases: false, port: 4321 };
   let dirFlag: string | undefined;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -270,6 +306,12 @@ function parseArgs(argv: string[]): Args {
       const n = Number(argv[++i]);
       if (!Number.isInteger(n) || n < 1) fail("--days requires a positive integer");
       args.days = n;
+    } else if (a === "--fix-aliases") {
+      args.fixAliases = true;
+    } else if (a === "--port") {
+      const n = Number(argv[++i]);
+      if (!Number.isInteger(n) || n < 1 || n > 65535) fail("--port requires an integer between 1 and 65535");
+      args.port = n;
     } else if (a === "--project") {
       args.project = argv[++i];
       if (!args.project) fail("--project requires a name");
@@ -379,11 +421,28 @@ function cmdTasks(dir: string): void {
   }
 }
 
-function cmdDoctor(dir: string): void {
+function cmdDoctor(dir: string, fixAliases: boolean): void {
   if (!fs.existsSync(dir)) fail(`no brain directory at ${dir} (run: cookbook-brain init)`);
+  if (fixAliases) {
+    // the sanctioned alias stamp: adds aliases: [<title>] in place, touches nothing else
+    const stamped = fixTitleAliases(dir);
+    if (stamped.length === 0) {
+      console.log("aliases: nothing to fix; every active note already carries an alias matching its title");
+    } else {
+      console.log(`aliases: stamped a title alias onto ${stamped.length} note(s):`);
+      for (const n of stamped) console.log(`  ${path.basename(n.file)}: aliases now include "${n.title}"`);
+    }
+  }
   const brain = loadBrain(dir);
   const problems = diagnose(dir);
   console.log(`cookbook-brain doctor: ${brain.notes.length} parseable note(s) in ${dir}`);
+  const missing = missingTitleAlias(brain);
+  if (missing.length > 0) {
+    console.log(
+      `${missing.length} alias warning(s) (not errors): active notes missing an alias matching their title, so Obsidian [[wikilinks]] to them will not resolve. Stamp them with: cookbook-brain doctor --fix-aliases`,
+    );
+    for (const n of missing) console.log(`  ${path.basename(n.file)}: no alias matching "${n.title}"`);
+  }
   if (problems.length === 0) {
     console.log("ok: every note parses, every wikilink resolves, every supersedes chain and task is consistent");
     return;
@@ -393,6 +452,30 @@ function cmdDoctor(dir: string): void {
     console.log(`  ${path.basename(p.file)}: ${p.message}`);
   }
   process.exit(1);
+}
+
+function cmdIndex(dir: string): void {
+  if (!fs.existsSync(dir)) fail(`no brain directory at ${dir} (run: cookbook-brain init)`);
+  const brain = loadBrain(dir);
+  const file = path.join(dir, INDEX_FILENAME);
+  // deliberately overwrites: INDEX.md is a generated view, not a note
+  fs.writeFileSync(file, renderIndexMd(brain));
+  console.log(`cookbook-brain: wrote ${file} (${activeNotes(brain).length} active note(s))`);
+  console.log("INDEX.md is a view, not a note: regenerating overwrites it, and the note scanner ignores it.");
+  if (brain.problems.length > 0) {
+    console.log(`${brain.problems.length} file(s) had problems and were left out; run: cookbook-brain doctor`);
+  }
+}
+
+async function cmdWeb(args: Args): Promise<void> {
+  if (!fs.existsSync(args.dir)) fail(`no brain directory at ${args.dir} (run: cookbook-brain init)`);
+  const { serveWeb } = await import("./web.ts");
+  const server = await serveWeb(args.dir, args.port);
+  const address = server.address();
+  const port = typeof address === "object" && address !== null ? address.port : args.port;
+  console.log(`cookbook-brain: read-only viewer for ${args.dir}`);
+  console.log(`  http://127.0.0.1:${port}  (localhost only; endpoints: / and /api/brain.json)`);
+  console.log("No mutating endpoints exist. Ctrl-C to stop.");
 }
 
 interface CommitResult {
@@ -617,7 +700,13 @@ async function main(): Promise<void> {
       cmdTasks(args.dir);
       break;
     case "doctor":
-      cmdDoctor(args.dir);
+      cmdDoctor(args.dir, args.fixAliases);
+      break;
+    case "index":
+      cmdIndex(args.dir);
+      break;
+    case "web":
+      await cmdWeb(args);
       break;
     case "dream":
       await cmdDream(args);
