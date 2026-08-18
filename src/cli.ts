@@ -5,6 +5,8 @@
  *   init     create a ./brain directory with a SCHEMA.md explaining the format
  *   serve    run the stdio MCP server over the brain directory
  *   log      list recent notes, newest first
+ *   credit   credit notes that proved true in completed work
+ *   tasks    list open and claimed tasks with their age
  *   doctor   validate every note and the link/supersede graph
  *
  * The brain directory resolves as: --dir flag, then the BRAIN_DIR environment
@@ -12,17 +14,28 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import { activeNotes, diagnose, loadBrain, type Note } from "./store.ts";
+import {
+  activeNotes,
+  confidenceFor,
+  creditNotes,
+  diagnose,
+  listTasks,
+  loadBrain,
+  tierFor,
+  type Note,
+} from "./store.ts";
 
 const USAGE = `cookbook-brain: agent memory as plain markdown files you own
 
 Usage: npx cookbook-brain <command> [options]
 
 Commands:
-  init      create the brain directory (with SCHEMA.md) in the current project
-  serve     run the stdio MCP server so agents can remember and recall
-  log       list recent notes, newest first
-  doctor    validate every note, wikilink, and supersedes chain
+  init            create the brain directory (with SCHEMA.md) in the current project
+  serve           run the stdio MCP server so agents can remember and recall
+  log             list recent notes, newest first
+  credit <id...>  credit notes whose facts held up in completed work
+  tasks           list open and claimed tasks with their age
+  doctor          validate every note, wikilink, supersedes chain, and task
 
 Options:
   --dir <path>   brain directory (default ./brain; BRAIN_DIR env also works)
@@ -67,7 +80,8 @@ Related: [[Docs routing decision]]
 The fields:
 
 - **id**: a ULID. Sortable by creation time, unique, never reused.
-- **type**: one of \`decision\`, \`gotcha\`, \`convention\`, \`note\`, \`open_thread\`.
+- **type**: one of \`decision\`, \`gotcha\`, \`convention\`, \`note\`,
+  \`open_thread\`, \`task\`.
 - **title**: short and stable. Other notes link to it by title.
 - **author.human**: the person this note is attributed to.
 - **author.agent**: the agent that wrote it, or \`null\` if the human wrote it
@@ -75,8 +89,37 @@ The fields:
 - **created**: ISO timestamp.
 - **supersedes**: the id of the note this one replaces, or \`null\`.
 - **credits**: how many times this note rode into work that verifiably
-  completed. Written now, used to lift confidence in a later release.
+  completed. Crediting raises recall confidence toward the note's cap.
 - **last_credited**: when that last happened, or \`null\`.
+
+Task notes (\`type: task\`) carry four more fields. The body holds the task's
+instructions; the frontmatter holds its lifecycle:
+
+- **status**: \`open\` until claimed, \`claimed\` until done, then \`done\`.
+- **assigned_to**: the agent label the task is addressed to, or \`null\`
+  meaning any agent may take it. Labels match case-insensitively.
+- **claimed_by**: the agent label that claimed the task, or \`null\`.
+- **result**: a short outcome string stamped on completion, or \`null\`.
+
+## Confidence
+
+Recall scores every note with a public formula:
+
+    score = clamp(cap - 0.10 + 0.05 * min(credits, 3) - staleness, 0.20, cap)
+
+- **cap** is the provenance ceiling: 0.95 for a human-written note, 0.85 for
+  an agent note citing a source (a \`source:\` line or a URL in the body),
+  0.60 for a bare agent claim. No amount of crediting lifts a note past its
+  cap.
+- Each credit lifts the score by 0.05, up to three credits; a fresh
+  uncredited note sits 0.10 under its cap.
+- **staleness** is 0.05 per full 90 days since \`last_credited\` (or
+  \`created\`, if never credited), capped at 0.15. Silence decays trust.
+- Scores are rounded to two decimals and floored at 0.20.
+
+Tiers: \`proven\` means credited at least once AND scoring 0.80 or higher;
+\`standing\` means 0.60 or higher; everything else is \`verify\`, meaning
+check it before you build on it.
 
 ## Links
 
@@ -89,10 +132,18 @@ surrounding lines. Titles match case-insensitively.
 
 Notes are never edited and never deleted. When a fact changes, a NEW note is
 written with \`supersedes\` pointing at the old note's id, and the old file
-gains a single \`superseded_by\` field so tools know to skip it. That one
-added field is the only change ever made to an existing file. History always
+gains a \`superseded_by\` field so tools know to skip it. History always
 survives, and \`git log\` on this directory is the story of what the team
 learned.
+
+Note bodies are append-only forever; exactly two counters may be stamped in
+place: \`credits\` and \`last_credited\`, written when work that relied on a
+note verifiably completed. That credit pair is the second sanctioned
+mutation of an existing file, alongside the \`superseded_by\` stamp described
+above. Task notes allow a third stamp set, on task-type notes only:
+\`status\`, \`claimed_by\`, and \`result\`, which move a task through its
+lifecycle. Nothing else about an existing file is ever touched, and no stamp
+ever changes a body.
 
 Superseded notes are excluded from recall by default.
 
@@ -105,6 +156,8 @@ describes: plain files, stable names, append-only history. Do not add it to
 
 interface Args {
   command: string | null;
+  /** positional arguments after the command (e.g. note ids for credit) */
+  rest: string[];
   dir: string;
   limit: number;
 }
@@ -116,7 +169,7 @@ function fail(msg: string): never {
 }
 
 function parseArgs(argv: string[]): Args {
-  const args: Args = { command: null, dir: "", limit: 20 };
+  const args: Args = { command: null, rest: [], dir: "", limit: 20 };
   let dirFlag: string | undefined;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -134,6 +187,8 @@ function parseArgs(argv: string[]): Args {
       fail(`unknown option: ${a}`);
     } else if (args.command === null) {
       args.command = a;
+    } else if (args.command === "credit") {
+      args.rest.push(a);
     } else {
       fail(`unexpected argument: ${a}`);
     }
@@ -188,13 +243,56 @@ function cmdLog(dir: string, limit: number): void {
   }
 }
 
+function cmdCredit(dir: string, ids: string[]): void {
+  if (!fs.existsSync(dir)) fail(`no brain directory at ${dir} (run: cookbook-brain init)`);
+  if (ids.length === 0) fail("credit requires at least one note id (find ids with: cookbook-brain log)");
+  try {
+    const credited = creditNotes(dir, ids);
+    console.log(`cookbook-brain: credited ${credited.length} note(s)\n`);
+    for (const n of credited) {
+      const confidence = confidenceFor(n);
+      console.log(`  ${n.id}  credits ${String(n.credits).padStart(2)}  confidence ${confidence.toFixed(2)} (${tierFor(confidence, n.credits)})  ${n.title}`);
+    }
+  } catch (e) {
+    console.error(`[cookbook-brain] ${(e as Error).message}`);
+    process.exit(1);
+  }
+}
+
+function ageDays(created: string): string {
+  const days = Math.max(0, Math.floor((Date.now() - Date.parse(created)) / (24 * 60 * 60 * 1000)));
+  if (days === 0) return "today";
+  return days === 1 ? "1 day old" : `${days} days old`;
+}
+
+function cmdTasks(dir: string): void {
+  if (!fs.existsSync(dir)) fail(`no brain directory at ${dir} (run: cookbook-brain init)`);
+  const brain = loadBrain(dir);
+  const tasks = listTasks(brain, "all").filter((t) => t.status !== "done");
+  if (tasks.length === 0) {
+    console.log(`cookbook-brain: no open or claimed tasks in ${dir}`);
+    return;
+  }
+  console.log(`cookbook-brain: ${tasks.length} waiting task(s) in ${dir}, oldest first\n`);
+  for (const t of tasks) {
+    const who =
+      t.status === "claimed"
+        ? `claimed by ${t.claimed_by}`
+        : t.assigned_to
+          ? `for ${t.assigned_to}`
+          : "for any agent";
+    console.log(`  ${t.id}  ${(t.status ?? "open").padEnd(7)}  ${t.title}`);
+    console.log(`  ${" ".repeat(t.id.length)}  ${" ".repeat(7)}  ${who}, ${ageDays(t.created)}`);
+  }
+}
+
 function cmdDoctor(dir: string): void {
   if (!fs.existsSync(dir)) fail(`no brain directory at ${dir} (run: cookbook-brain init)`);
   const brain = loadBrain(dir);
   const problems = diagnose(dir);
   console.log(`cookbook-brain doctor: ${brain.notes.length} parseable note(s) in ${dir}`);
   if (problems.length === 0) {
-    console.log("ok: every note parses, every wikilink resolves, every supersedes chain is consistent");
+    console.log("ok: every note parses, every wikilink resolves, every supersedes chain and task is consistent");
     return;
   }
   console.log(`${problems.length} problem(s):\n`);
@@ -217,6 +315,12 @@ async function main(): Promise<void> {
     }
     case "log":
       cmdLog(args.dir, args.limit);
+      break;
+    case "credit":
+      cmdCredit(args.dir, args.rest);
+      break;
+    case "tasks":
+      cmdTasks(args.dir);
       break;
     case "doctor":
       cmdDoctor(args.dir);
