@@ -14,7 +14,13 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
+  LOCK_STALE_MS,
+  abandonTask,
+  acquireLock,
+  activeConventions,
+  activeLock,
   activeNotes,
+  assertNotLocked,
   assignTask,
   backlinksFor,
   capFor,
@@ -29,10 +35,12 @@ import {
   isSourced,
   listTasks,
   loadBrain,
+  lockPath,
   noteFilename,
   openTasksFor,
   parseNoteFile,
   recall,
+  releaseLock,
   searchRanked,
   serializeNote,
   slugify,
@@ -42,7 +50,7 @@ import {
   ulid,
   type Note,
 } from "../src/store.ts";
-import { buildDigest, extractJson, hygieneFindings } from "../src/dream.ts";
+import { REFUTER_PROMPT_CHAR_CAP, buildDigest, extractJson, hygieneFindings, planReview, type Proposal } from "../src/dream.ts";
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 const BASIC = path.join(ROOT, "test", "fixtures", "basic-brain");
@@ -881,10 +889,11 @@ async function mcpSmokeTest(): Promise<void> {
       client.notify("notifications/initialized");
     });
 
-    await checkAsync("mcp: tools/list exposes all nine tools with teaching descriptions", async () => {
+    await checkAsync("mcp: tools/list exposes all ten tools with teaching descriptions", async () => {
       const list = await client.request("tools/list");
       const names = list.tools.map((t: any) => t.name).sort();
       assert.deepEqual(names, [
+        "abandon_task",
         "assign_task",
         "claim_task",
         "complete_task",
@@ -895,6 +904,10 @@ async function mcpSmokeTest(): Promise<void> {
         "search",
         "supersede",
       ]);
+      const abandon = list.tools.find((t: any) => t.name === "abandon_task");
+      assert.ok(abandon.description.includes("reason"), "abandon_task must teach that the reason goes on the record");
+      const rememberSource = list.tools.find((t: any) => t.name === "remember");
+      assert.ok(JSON.stringify(rememberSource.inputSchema).includes("auditable"), "remember must teach that cited memory is auditable memory");
       const remember = list.tools.find((t: any) => t.name === "remember");
       assert.ok(remember.description.includes("ATOMIC"), "description must teach atomicity");
       assert.ok(remember.description.includes("source"), "description must teach sourcing");
@@ -904,6 +917,7 @@ async function mcpSmokeTest(): Promise<void> {
       assert.ok(complete.description.includes("helped_note_ids"), "complete_task must teach the crediting moment");
       const recallTool = list.tools.find((t: any) => t.name === "recall");
       assert.ok(recallTool.description.includes("open_tasks"), "recall must teach task discovery");
+      assert.ok(recallTool.description.includes("apply these to your work"), "recall must teach that conventions are to be applied");
     });
 
     let noteId = "";
@@ -1586,7 +1600,537 @@ check("cli dream: --model reaches claude -p, and the proposer/refuter token ceil
   }
 });
 
+// ---- v0.4: source frontmatter field ----
+
+check("source field: serialize/parse round-trip, including URL values that need quoting", () => {
+  const note: Omit<Note, "file"> = {
+    id: ulid(),
+    type: "gotcha",
+    title: "Sourced via frontmatter",
+    author: { human: "diego", agent: "codex" },
+    created: "2026-08-18T10:00:00.000Z",
+    supersedes: null,
+    source: "https://example.com/spec#section-3",
+    credits: 0,
+    last_credited: null,
+    body: "a body with no citation of its own",
+  };
+  const parsed = parseNoteFile("x.md", serializeNote(note));
+  assert.deepEqual(parsed.problems, []);
+  const { file: _f, ...roundTripped } = parsed.note!;
+  assert.deepEqual(roundTripped, note);
+});
+
+check("source field: earns the 0.85 sourced-agent cap; the body heuristic still works; human cap unchanged", () => {
+  const viaField = fakeNote({ author: { human: "d", agent: "codex" }, source: "docs/spec.md", body: "no citation in the body" });
+  assert.equal(capFor(viaField), 0.85, "the formal source field must trigger the sourced cap");
+  assert.equal(confidenceFor(viaField, NOW), 0.75);
+  const viaBody = fakeNote({ author: { human: "d", agent: "codex" }, body: "source: docs/spec.md" });
+  assert.equal(capFor(viaBody), 0.85, "the body heuristic must keep working (backward compatible)");
+  const bare = fakeNote({ author: { human: "d", agent: "codex" } });
+  assert.equal(capFor(bare), 0.6);
+  const human = fakeNote({ source: "docs/spec.md" });
+  assert.equal(capFor(human), 0.95, "a human note stays at the human cap with or without a source");
+});
+
+check("source field: createNote trims it, omits it when blank, and doctor flags a blank source on disk", () => {
+  const dir = tmpdir("brain-source-");
+  try {
+    const author = { human: "diego", agent: "codex" };
+    const sourced = createNote(dir, { type: "note", title: "Sourced", body: "x", source: "  RFC 9110  ", author });
+    assert.equal(sourced.source, "RFC 9110");
+    assert.ok(fs.readFileSync(sourced.file, "utf8").includes("source: RFC 9110"), "source must land in frontmatter");
+    const blank = createNote(dir, { type: "note", title: "Blank source", body: "y", source: "   ", author });
+    assert.equal(blank.source, undefined, "a blank source is omitted, not written");
+    assert.ok(!fs.readFileSync(blank.file, "utf8").includes("source:"), "no source line for a blank source");
+    assert.deepEqual(diagnose(dir), []);
+    // a hand-edited file with an empty source: line is a doctor problem
+    const bad = serializeNote({
+      id: ulid(),
+      type: "note",
+      title: "Hand-edited",
+      author,
+      created: "2026-08-18T10:00:00.000Z",
+      supersedes: null,
+      credits: 0,
+      last_credited: null,
+      body: "z",
+    }).replace("supersedes: null", "supersedes: null\nsource:");
+    fs.writeFileSync(path.join(dir, "hand-edited.md"), bad);
+    const messages = diagnose(dir).map((p) => p.message).join("\n");
+    assert.ok(/source must be a non-empty string/.test(messages), messages);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- v0.4: abandon_task ----
+
+check("abandonTask: claimed goes back to open with claimed_by cleared and the reason stamped on disk", () => {
+  const dir = tmpdir("brain-abandon-");
+  try {
+    const author = { human: "diego", agent: "claude-code" };
+    const task = assignTask(dir, { title: "Tough one", instructions: "needs prod access", author });
+    claimTask(dir, task.id, "codex");
+    const back = abandonTask(dir, task.id, "No prod credentials; needs a human or an agent with access.", "CODEX");
+    assert.equal(back.status, "open");
+    assert.equal(back.claimed_by, null);
+    assert.equal(back.abandon_reason, "No prod credentials; needs a human or an agent with access.");
+    const reread = parseNoteFile(task.file, fs.readFileSync(task.file, "utf8")).note!;
+    assert.equal(reread.status, "open");
+    assert.equal(reread.claimed_by, null);
+    assert.equal(reread.abandon_reason, "No prod credentials; needs a human or an agent with access.");
+    assert.equal(reread.body, "needs prod access", "abandoning must never touch the instructions");
+    assert.deepEqual(diagnose(dir), [], "an abandoned task must validate clean");
+    // the abandoned task is claimable again, and the next claim clears the reason
+    const reclaimed = claimTask(dir, task.id, "gemini");
+    assert.equal(reclaimed.status, "claimed");
+    assert.equal(reclaimed.abandon_reason, undefined);
+    const rereadClaimed = parseNoteFile(task.file, fs.readFileSync(task.file, "utf8")).note!;
+    assert.equal(rereadClaimed.abandon_reason, undefined, "the next claim must clear abandon_reason on disk");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+check("abandonTask: refuses open tasks, done tasks, the wrong agent, and empty reasons", () => {
+  const dir = tmpdir("brain-abandon2-");
+  try {
+    const author = { human: "diego", agent: "claude-code" };
+    const open = assignTask(dir, { title: "Still open", instructions: "x", author });
+    assert.throws(() => abandonTask(dir, open.id, "reason", "codex"), /not claimed/);
+    claimTask(dir, open.id, "codex");
+    assert.throws(() => abandonTask(dir, open.id, "reason", "gemini"), /claimed by codex, not gemini/);
+    assert.throws(() => abandonTask(dir, open.id, "   ", "codex"), /requires a reason/);
+    assert.throws(() => abandonTask(dir, open.id, "reason", "  "), /agent's label/);
+    completeTask(dir, open.id, "done after all", "codex");
+    assert.throws(() => abandonTask(dir, open.id, "reason", "codex"), /already done/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+check("cli tasks: an abandoned task shows its reason", () => {
+  const dir = tmpdir("brain-cli-abandon-");
+  try {
+    const author = { human: "diego", agent: "claude-code" };
+    const task = assignTask(dir, { title: "Bounced work", instructions: "x", author });
+    claimTask(dir, task.id, "codex");
+    abandonTask(dir, task.id, "Blocked on missing API key", "codex");
+    const r = runCli(["tasks", "--dir", dir]);
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(r.stdout.includes("open"), r.stdout);
+    assert.ok(r.stdout.includes("abandoned earlier: Blocked on missing API key"), r.stdout);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- v0.4: conventions helper ----
+
+check("activeConventions: only active convention-type notes, superseded ones excluded", () => {
+  const dir = tmpdir("brain-conv-");
+  try {
+    const author = { human: "diego", agent: null };
+    const keep = createNote(dir, { type: "convention", title: "Two-space indent", body: "The linter says so.", author });
+    const old = createNote(dir, { type: "convention", title: "Old rule", body: "was true once", author });
+    createNote(dir, { type: "note", title: "Not a convention", body: "just a note", author });
+    supersedeNote(dir, old.id, { type: "convention", title: "New rule", body: "is true now", author });
+    const titles = activeConventions(loadBrain(dir)).map((n) => n.title).sort();
+    assert.deepEqual(titles, ["New rule", "Two-space indent"], "superseded conventions and non-conventions must not ride");
+    assert.equal(activeConventions(loadBrain(dir)).find((n) => n.id === keep.id)!.body, "The linter says so.");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- v0.4: brain lock ----
+
+check("lock: acquire/release round-trip; fresh foreign locks block, stale ones are overridden with a flag", () => {
+  const dir = tmpdir("brain-lock-");
+  try {
+    assert.equal(activeLock(dir), null, "no lock file means no lock");
+    const first = acquireLock(dir, NOW);
+    assert.equal(first.overrodeStale, false);
+    assert.ok(fs.existsSync(lockPath(dir)), "the lock file must exist while held");
+    assert.equal(activeLock(dir, NOW)!.pid, process.pid);
+    // own pid may re-acquire (same process, no deadlock)
+    assert.equal(acquireLock(dir, NOW).overrodeStale, false);
+    releaseLock(dir);
+    assert.ok(!fs.existsSync(lockPath(dir)), "release must remove the lock file");
+    // a fresh lock held by another pid refuses
+    fs.writeFileSync(lockPath(dir), JSON.stringify({ pid: 999_999_999, timestamp: new Date(NOW).toISOString() }));
+    assert.throws(() => acquireLock(dir, NOW + 1000), /locked by another apply/);
+    // the same lock, 10 minutes later, is stale: acquire succeeds and reports the override
+    const overridden = acquireLock(dir, NOW + LOCK_STALE_MS);
+    assert.equal(overridden.overrodeStale, true, "a stale lock must be overridden, with the override reported");
+    releaseLock(dir);
+    // garbage lock files never block
+    fs.writeFileSync(lockPath(dir), "not json at all");
+    assert.equal(activeLock(dir, NOW), null);
+    assert.doesNotThrow(() => assertNotLocked(dir, NOW));
+    releaseLock(dir);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+check("lock: assertNotLocked blocks writes only during a fresh foreign lock; stale and own locks never block", () => {
+  const dir = tmpdir("brain-lock2-");
+  try {
+    assert.doesNotThrow(() => assertNotLocked(dir, NOW), "no lock, no block");
+    fs.writeFileSync(lockPath(dir), JSON.stringify({ pid: 999_999_999, timestamp: new Date(NOW).toISOString() }));
+    assert.throws(() => assertNotLocked(dir, NOW + 1000), /temporarily locked/);
+    assert.doesNotThrow(() => assertNotLocked(dir, NOW + LOCK_STALE_MS), "a stale lock must not block writes");
+    fs.writeFileSync(lockPath(dir), JSON.stringify({ pid: process.pid, timestamp: new Date(NOW).toISOString() }));
+    assert.doesNotThrow(() => assertNotLocked(dir, NOW + 1000), "our own lock must not block us");
+    // the lock file never becomes a note and never bothers doctor
+    createNote(dir, { type: "note", title: "Real note", body: "x", author: { human: "d", agent: null } });
+    assert.equal(loadBrain(dir).notes.length, 1);
+    assert.deepEqual(diagnose(dir), []);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+check("cli dream --apply: a fresh foreign lock means nothing is applied and the report says why", () => {
+  const dir = tmpdir("brain-dream-lock-");
+  try {
+    const { a, b } = seedMergePair(dir);
+    fs.writeFileSync(lockPath(dir), JSON.stringify({ pid: 999_999_999, timestamp: new Date().toISOString() }));
+    const r = runCli(["dream", "--apply", "--dir", dir], { env: dreamEnv({ FAKE_MERGE_IDS: `${a.id},${b.id}` }) });
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(r.stdout.includes("could not take the brain lock"), r.stdout);
+    const brain = loadBrain(dir);
+    assert.equal(brain.notes.length, 2, "no notes may be written while another apply holds the lock");
+    assert.ok(brain.notes.every((n) => n.superseded_by === undefined), "nothing may be stamped");
+    assert.ok(findDreamReport(dir).includes("could not take the brain lock"), "the report must record the lock refusal");
+    assert.ok(fs.existsSync(lockPath(dir)), "the foreign lock must not be deleted by the refused apply");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+check("cli dream --apply: a stale lock is overridden with a warning, the apply proceeds, and the lock is released", () => {
+  const dir = tmpdir("brain-dream-stale-");
+  try {
+    const { a, b } = seedMergePair(dir);
+    const staleStamp = new Date(Date.now() - LOCK_STALE_MS - 60_000).toISOString();
+    fs.writeFileSync(lockPath(dir), JSON.stringify({ pid: 999_999_999, timestamp: staleStamp }));
+    const r = runCli(["dream", "--apply", "--dir", dir], { env: dreamEnv({ FAKE_MERGE_IDS: `${a.id},${b.id}` }) });
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(r.stdout.includes("overrode a stale brain lock"), r.stdout);
+    assert.ok(r.stdout.includes("applied: 1 change(s)"), r.stdout);
+    assert.ok(loadBrain(dir).notes.some((n) => n.consolidates !== undefined), "the apply must proceed past a stale lock");
+    assert.ok(!fs.existsSync(lockPath(dir)), "the lock must be released after the apply");
+    assert.ok(findDreamReport(dir).includes("overrode a stale brain lock"), "the report must record the override");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- v0.4: dream --json ----
+
+check("cli dream --json: machine-readable report on stdout, markdown report still written", () => {
+  const dir = tmpdir("brain-dream-json-");
+  try {
+    const { a, b } = seedMergePair(dir);
+    const r = runCli(["dream", "--json", "--dir", dir], { env: dreamEnv({ FAKE_MERGE_IDS: `${a.id},${b.id}` }) });
+    assert.equal(r.status, 0, r.stderr);
+    const payload = JSON.parse(r.stdout);
+    assert.equal(payload.mode, "report-only");
+    assert.equal(payload.brain, dir);
+    assert.equal(payload.active_notes, 2);
+    assert.equal(payload.refuter_ran, true);
+    assert.equal(payload.proposals.length, 1);
+    assert.equal(payload.proposals[0].op, "merge");
+    assert.equal(payload.verdicts.length, 1);
+    assert.equal(payload.verdicts[0].verdict, "keep");
+    assert.equal(payload.kept, 1);
+    assert.deepEqual(payload.applied, [], "report-only json must show nothing applied");
+    assert.deepEqual(payload.skipped_review, []);
+    assert.equal(payload.commit, null, "no --commit means commit: null");
+    assert.ok(fs.existsSync(payload.report_file), "the markdown report file must still be written");
+    assert.ok(findDreamReport(dir).includes("# Dream report"));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- v0.4: dream --commit ----
+
+const GIT_TEST_ENV = {
+  GIT_CONFIG_GLOBAL: "/dev/null",
+  GIT_CONFIG_SYSTEM: "/dev/null",
+  GIT_AUTHOR_NAME: "braintest",
+  GIT_AUTHOR_EMAIL: "braintest@example.com",
+  GIT_COMMITTER_NAME: "braintest",
+  GIT_COMMITTER_EMAIL: "braintest@example.com",
+};
+
+function gitIn(cwd: string, args: string[]) {
+  const r = spawnSync("git", args, { cwd, env: { ...process.env, ...GIT_TEST_ENV }, encoding: "utf8", timeout: 30_000 });
+  assert.equal(r.status, 0, `git ${args.join(" ")} failed: ${r.stderr}`);
+  return r.stdout;
+}
+
+check("cli dream --commit: commits ONLY brain paths after apply; a dirty repo elsewhere is untouched", () => {
+  const repo = tmpdir("brain-commit-repo-");
+  try {
+    gitIn(repo, ["init", "-q"]);
+    fs.writeFileSync(path.join(repo, "README.md"), "a project\n");
+    gitIn(repo, ["add", "README.md"]);
+    gitIn(repo, ["commit", "-q", "-m", "initial"]);
+    const dir = path.join(repo, "brain");
+    fs.mkdirSync(dir);
+    const { a, b } = seedMergePair(dir);
+    // dirt outside the brain dir: must never ride the dream commit
+    fs.writeFileSync(path.join(repo, "untracked-scratch.txt"), "dirty\n");
+    fs.appendFileSync(path.join(repo, "README.md"), "modified\n");
+    const r = runCli(["dream", "--apply", "--commit", "--dir", dir], {
+      env: dreamEnv({ FAKE_MERGE_IDS: `${a.id},${b.id}`, ...GIT_TEST_ENV }),
+    });
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(r.stdout.includes("applied: 1 change(s)"), r.stdout);
+    assert.ok(r.stdout.includes('commit: committed the brain directory'), r.stdout);
+    const subject = gitIn(repo, ["log", "-1", "--format=%s"]).trim();
+    assert.match(subject, /^dream: \d{4}-\d{2}-\d{2} applied 1 proposals$/);
+    const files = gitIn(repo, ["show", "--name-only", "--format=", "HEAD"]).trim().split("\n").filter(Boolean);
+    assert.ok(files.length > 0, "the commit must contain files");
+    assert.ok(files.every((f) => f.startsWith("brain/")), `only brain paths may be committed, got: ${files.join(", ")}`);
+    const status = gitIn(repo, ["status", "--porcelain"]);
+    assert.ok(status.includes("untracked-scratch.txt"), "untracked dirt outside the brain must survive uncommitted");
+    assert.ok(status.includes("README.md"), "modified files outside the brain must survive uncommitted");
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+check("cli dream --commit: refuses without --apply; outside a git repo it is a polite no-op", () => {
+  const dir = tmpdir("brain-commit-norepo-");
+  try {
+    const { a, b } = seedMergePair(dir);
+    const bad = runCli(["dream", "--commit", "--dir", dir], { env: dreamEnv({}) });
+    assert.equal(bad.status, 2, "commit without apply must fail with guidance");
+    assert.ok(bad.stderr.includes("--commit requires --apply"), bad.stderr);
+    const r = runCli(["dream", "--apply", "--commit", "--dir", dir], {
+      env: dreamEnv({ FAKE_MERGE_IDS: `${a.id},${b.id}`, ...GIT_TEST_ENV }),
+    });
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(r.stdout.includes("applied: 1 change(s)"), r.stdout);
+    assert.ok(r.stdout.includes("not committed: the brain directory is not inside a git repository"), r.stdout);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- v0.4: contradiction dedupe ----
+
+check("cli dream --apply: a contradiction already covered by an active open_thread is not filed twice", () => {
+  const dir = tmpdir("brain-dream-dedupe-");
+  try {
+    const author = { human: "diego", agent: null };
+    const c1 = createNote(dir, { type: "decision", title: "Deploy on Fridays", body: "ship it", author });
+    const c2 = createNote(dir, { type: "decision", title: "Never deploy on Fridays", body: "outage settled it", author });
+    const existing = createNote(dir, {
+      type: "open_thread",
+      title: "Which Friday rule holds?",
+      body: `Earlier flag: decide between ${c1.id} and ${c2.id}.`,
+      author,
+    });
+    const r = runCli(["dream", "--apply", "--dir", dir], { env: dreamEnv({ FAKE_CONTRA_IDS: `${c1.id},${c2.id}` }) });
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(r.stdout.includes("skipped filing contradiction"), r.stdout);
+    const threads = loadBrain(dir).notes.filter((n) => n.type === "open_thread");
+    assert.deepEqual(threads.map((t) => t.id), [existing.id], "no second open_thread may be filed for the same pair");
+    assert.ok(findDreamReport(dir).includes("already references both notes"), "the report must record the dedupe");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+check("cli dream --apply: a superseded open_thread does NOT suppress a fresh contradiction flag", () => {
+  const dir = tmpdir("brain-dream-dedupe2-");
+  try {
+    const author = { human: "diego", agent: null };
+    const c1 = createNote(dir, { type: "decision", title: "Deploy on Fridays", body: "ship it", author });
+    const c2 = createNote(dir, { type: "decision", title: "Never deploy on Fridays", body: "outage settled it", author });
+    const old = createNote(dir, { type: "open_thread", title: "Old flag", body: `about ${c1.id} and ${c2.id}`, author });
+    supersedeNote(dir, old.id, { type: "note", title: "Resolved once", body: "was settled, then diverged again", author });
+    const r = runCli(["dream", "--apply", "--dir", dir], { env: dreamEnv({ FAKE_CONTRA_IDS: `${c1.id},${c2.id}` }) });
+    assert.equal(r.status, 0, r.stderr);
+    const threads = activeNotes(loadBrain(dir)).filter((n) => n.type === "open_thread");
+    assert.equal(threads.length, 1, "an inactive open_thread must not block a fresh flag");
+    assert.ok(threads[0].title.startsWith("Contradiction:"), threads[0].title);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- v0.4: refuter prompt size guard ----
+
+check("planReview: everything fits under the cap by default; oversized proposals are dropped largest-first", () => {
+  const dir = tmpdir("brain-plan-");
+  try {
+    const author = { human: "diego", agent: null };
+    const small1 = createNote(dir, { type: "note", title: "Small A", body: "tiny", author });
+    const small2 = createNote(dir, { type: "note", title: "Small B", body: "also tiny", author });
+    const big1 = createNote(dir, { type: "note", title: "Big A", body: "x".repeat(15_000), author });
+    const big2 = createNote(dir, { type: "note", title: "Big B", body: "y".repeat(15_000), author });
+    const brain = loadBrain(dir);
+    const smallMerge: Proposal = { op: "merge", source_ids: [small1.id, small2.id], type: "note", title: "Merged small", body: "b", rationale: "r" };
+    const bigMerge: Proposal = { op: "merge", source_ids: [big1.id, big2.id], type: "note", title: "Merged big", body: "b", rationale: "r" };
+    assert.deepEqual(planReview([smallMerge], brain), { reviewed: [0], skipped: [] }, "small proposals all fit");
+    assert.deepEqual(planReview([bigMerge, smallMerge], brain), { reviewed: [1], skipped: [0] }, "the largest proposal is dropped first");
+    assert.deepEqual(planReview([smallMerge, bigMerge], brain), { reviewed: [0], skipped: [1] }, "index order does not matter, size does");
+    assert.deepEqual(planReview([bigMerge], brain), { reviewed: [], skipped: [0] }, "a single oversized proposal leaves nothing to review");
+    assert.deepEqual(planReview([], brain), { reviewed: [], skipped: [] });
+    assert.ok(REFUTER_PROMPT_CHAR_CAP === 24_000, "the documented cap");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+check("cli dream --apply: an oversized proposal is recorded as not reviewed and never applied; the rest still are", () => {
+  const dir = tmpdir("brain-dream-size-");
+  try {
+    const author = { human: "diego", agent: null };
+    const big1 = createNote(dir, { type: "note", title: "Huge dossier A", body: "a".repeat(15_000), author });
+    const big2 = createNote(dir, { type: "note", title: "Huge dossier B", body: "b".repeat(15_000), author });
+    const c1 = createNote(dir, { type: "decision", title: "Deploy on Fridays", body: "ship it", author });
+    const c2 = createNote(dir, { type: "decision", title: "Never deploy on Fridays", body: "outage settled it", author });
+    const r = runCli(["dream", "--apply", "--dir", dir], {
+      env: dreamEnv({ FAKE_MERGE_IDS: `${big1.id},${big2.id}`, FAKE_CONTRA_IDS: `${c1.id},${c2.id}` }),
+    });
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(r.stdout.includes("not reviewed (too large for the refuter prompt cap): proposal 0"), r.stdout);
+    const report = findDreamReport(dir);
+    assert.ok(report.includes("refuter: ran"), "the refuter still reviews what fits");
+    assert.ok(report.includes("dropped from review by the prompt size cap"), report);
+    assert.ok(report.includes("not reviewed: too large"), report);
+    const brain = loadBrain(dir);
+    assert.equal(brain.byId.get(big1.id)!.superseded_by, undefined, "the unreviewed merge must NOT be applied");
+    assert.equal(brain.byId.get(big2.id)!.superseded_by, undefined);
+    assert.ok(brain.notes.some((n) => n.type === "open_thread"), "the reviewed contradiction must still be applied");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 fs.rmSync(shimDir, { recursive: true, force: true });
+
+/**
+ * v0.4 MCP features over real stdio: conventions riding recall, the source
+ * field, abandon_task, and the brain lock respected by write tools only.
+ */
+async function mcpV4FeatureTest(): Promise<void> {
+  const dir = tmpdir("brain-mcp-v4-");
+  const client = spawnServer(dir, { BRAIN_HUMAN: "diego" });
+  const call = async (name: string, args: unknown) => {
+    const res = await client.request("tools/call", { name, arguments: args });
+    const isError = res.isError === true;
+    return { payload: isError ? null : JSON.parse(res.content[0].text), isError, raw: res };
+  };
+  try {
+    await client.request("initialize", {
+      protocolVersion: "2025-06-18",
+      capabilities: {},
+      clientInfo: { name: "brain-test", version: "0.0.0" },
+    });
+    client.notify("notifications/initialized");
+
+    let conventionId = "";
+    await checkAsync("mcp v4: conventions ride EVERY recall verbatim, even when the query matches nothing", async () => {
+      const conv = await call("remember", {
+        type: "convention",
+        title: "No em dashes in copy",
+        body: "Restructure the sentence instead.",
+        agent_label: "claude-code",
+      });
+      conventionId = conv.payload.id;
+      await call("remember", { type: "note", title: "Unrelated fact", body: "the sky is up", agent_label: "claude-code" });
+      const res = await call("recall", { query: "zzqxv-matches-nothing" });
+      assert.equal(res.payload.count, 0, "the query matches no notes");
+      assert.deepEqual(
+        res.payload.conventions,
+        [{ id: conventionId, title: "No em dashes in copy", body: "Restructure the sentence instead." }],
+        "conventions must ride verbatim regardless of the query",
+      );
+    });
+
+    await checkAsync("mcp v4: a superseded convention stops riding recall (negative)", async () => {
+      const replaced = await call("supersede", {
+        old_id: conventionId,
+        type: "convention",
+        title: "No em dashes in copy",
+        body: "Restructure the sentence instead. Semicolons are fine.",
+        agent_label: "claude-code",
+      });
+      const res = await call("recall", { query: "zzqxv-matches-nothing" });
+      assert.equal(res.payload.conventions.length, 1, "exactly one active convention may ride");
+      assert.equal(res.payload.conventions[0].id, replaced.payload.note.id);
+      assert.ok(res.payload.conventions[0].body.includes("Semicolons"), "the successor rides, not the superseded original");
+    });
+
+    let sourcedId = "";
+    await checkAsync("mcp v4: remember with the source field earns the sourced cap without a body citation", async () => {
+      const res = await call("remember", {
+        type: "gotcha",
+        title: "Registry mirrors lag by a day",
+        body: "Fresh publishes 404 on the mirror for up to 24 hours.",
+        source: "https://example.com/registry-docs",
+        agent_label: "codex",
+      });
+      sourcedId = res.payload.id;
+      // fmScalar quotes values containing a colon, so the URL lands quoted
+      assert.ok(fs.readFileSync(res.payload.file, "utf8").includes('source: "https://example.com/registry-docs"'));
+      const recalled = await call("recall", { query: "Registry mirrors" });
+      assert.equal(recalled.payload.notes[0].confidence, 0.75, "source field: 0.85 cap - 0.10 fresh, not the bare 0.50");
+      assert.equal(recalled.payload.notes[0].tier, "standing");
+    });
+
+    await checkAsync("mcp v4: abandon_task returns a claimed task to open with the reason on the record", async () => {
+      const t = await call("assign_task", { title: "Needs prod access", instructions: "rotate the key", agent_label: "claude-code" });
+      const taskId = t.payload.task.id;
+      await call("claim_task", { id: taskId, agent_label: "codex" });
+      const wrong = await call("abandon_task", { id: taskId, reason: "hijack attempt", agent_label: "gemini" });
+      assert.equal(wrong.isError, true, "only the claimer may abandon");
+      assert.ok(wrong.raw.content[0].text.includes("only the claimer"), wrong.raw.content[0].text);
+      const back = await call("abandon_task", { id: taskId, reason: "No prod credentials on this machine.", agent_label: "codex" });
+      assert.equal(back.payload.task.status, "open");
+      assert.equal(back.payload.task.claimed_by, null);
+      assert.equal(back.payload.task.abandon_reason, "No prod credentials on this machine.");
+      const listed = await call("list_tasks", { filter: "open", agent_label: "gemini" });
+      assert.equal(listed.payload.tasks[0].abandon_reason, "No prod credentials on this machine.", "the reason must be visible to the next agent");
+      const reclaim = await call("claim_task", { id: taskId, agent_label: "gemini" });
+      assert.equal(reclaim.payload.task.abandon_reason, null, "the next claim clears the reason");
+    });
+
+    await checkAsync("mcp v4: a fresh foreign lock blocks writes but never reads; a stale lock blocks nothing", async () => {
+      fs.writeFileSync(lockPath(dir), JSON.stringify({ pid: 999_999_999, timestamp: new Date().toISOString() }));
+      const blockedWrite = await call("remember", { type: "note", title: "During lock", body: "x", agent_label: "codex" });
+      assert.equal(blockedWrite.isError, true, "remember must refuse during an active apply");
+      assert.ok(blockedWrite.raw.content[0].text.includes("temporarily locked"), blockedWrite.raw.content[0].text);
+      const blockedCredit = await call("credit", { ids: [sourcedId] });
+      assert.equal(blockedCredit.isError, true, "credit must refuse during an active apply");
+      const read = await call("recall", { query: "Registry mirrors" });
+      assert.equal(read.isError, false, "reads never block on the lock");
+      assert.equal(read.payload.count, 1);
+      const searchRead = await call("search", { query: "registry" });
+      assert.equal(searchRead.isError, false, "search never blocks on the lock");
+      // stale lock: writes flow again
+      fs.writeFileSync(lockPath(dir), JSON.stringify({ pid: 999_999_999, timestamp: new Date(Date.now() - LOCK_STALE_MS - 1000).toISOString() }));
+      const afterStale = await call("remember", { type: "note", title: "After stale lock", body: "y", agent_label: "codex" });
+      assert.equal(afterStale.isError, false, "a stale lock must not block writes");
+      fs.rmSync(lockPath(dir), { force: true });
+    });
+  } finally {
+    client.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+await mcpV4FeatureTest();
 
 if (failures > 0) {
   console.error(`\n${failures} test(s) FAILED`);

@@ -1,16 +1,22 @@
 /**
  * cookbook-brain MCP server (stdio).
  *
- * Exposes the brain directory to any MCP client as nine tools: remember,
+ * Exposes the brain directory to any MCP client as ten tools: remember,
  * recall, supersede, search, credit, assign_task, list_tasks, claim_task,
- * and complete_task. Human attribution comes from the BRAIN_HUMAN
- * environment variable, falling back to the OS username.
+ * complete_task, and abandon_task. Human attribution comes from the
+ * BRAIN_HUMAN environment variable, falling back to the OS username.
+ *
+ * Write tools respect the brain lock a dream --apply holds while it writes;
+ * reads never block on it.
  */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import {
   NOTE_TYPES,
+  abandonTask,
+  activeConventions,
+  assertNotLocked,
   assignTask,
   claimTask,
   completeTask,
@@ -50,6 +56,7 @@ function taskView(t: Note, now: number = Date.now()) {
     assigned_to: t.assigned_to ?? null,
     claimed_by: t.claimed_by ?? null,
     result: t.result ?? null,
+    abandon_reason: t.abandon_reason ?? null,
     created: t.created,
     age_days: Math.max(0, Math.floor((now - Date.parse(t.created)) / DAY_MS)),
     instructions: t.body,
@@ -75,32 +82,42 @@ const requiredLabelField = z
     'Your agent label, e.g. "claude-code" or "codex". Required: the task lifecycle records exactly who took and finished the work. Labels match case-insensitively.',
   );
 
+const sourceField = z
+  .string()
+  .optional()
+  .describe(
+    "Where this fact comes from: a URL, file path, or ticket id. Cited memory is auditable memory: a note with a source earns the higher sourced confidence cap (0.85 instead of 0.60 for agent notes), and future readers can check the claim against its origin.",
+  );
+
 export function buildServer(dir: string, env: NodeJS.ProcessEnv = process.env): McpServer {
-  const server = new McpServer({ name: "cookbook-brain", version: "0.3.0" });
+  const server = new McpServer({ name: "cookbook-brain", version: "0.4.0" });
 
   server.registerTool(
     "remember",
     {
       title: "Remember a note in the brain",
       description:
-        "Write one durable note to the team brain. Use this the moment you learn something worth keeping: a decision and its why, a gotcha that cost real time, a convention the team should follow, or an open thread. Keep notes ATOMIC (one fact per note) and cite your evidence in the body with a `source:` line or a URL; sourced notes earn higher recall confidence. Link related notes by writing their titles as [[wikilinks]] in the body. Do not remember secrets, transient state, or anything you could re-derive in seconds. To correct an existing note, use supersede instead of writing a near-duplicate.",
+        "Write one durable note to the team brain. Use this the moment you learn something worth keeping: a decision and its why, a gotcha that cost real time, a convention the team should follow, or an open thread. Keep notes ATOMIC (one fact per note) and cite your evidence in the `source` field (or a `source:` line or URL in the body); cited memory is auditable memory, and sourced notes earn higher recall confidence. Link related notes by writing their titles as [[wikilinks]] in the body. Do not remember secrets, transient state, or anything you could re-derive in seconds. To correct an existing note, use supersede instead of writing a near-duplicate.",
       inputSchema: {
         type: typeField,
         title: z.string().describe("Short, specific, and stable: other notes will link to this title with [[wikilinks]]."),
         body: z
           .string()
           .describe(
-            "Markdown. Say what is true, why it matters, and how you know (source: line or URL). Reference related notes as [[Their Title]].",
+            "Markdown. Say what is true, why it matters, and how you know (source field, or a source: line or URL in the body). Reference related notes as [[Their Title]].",
           ),
+        source: sourceField,
         agent_label: agentLabelField,
       },
     },
-    async ({ type, title, body, agent_label }) => {
+    async ({ type, title, body, source, agent_label }) => {
       try {
+        assertNotLocked(dir);
         const note = createNote(dir, {
           type: type as NoteType,
           title,
           body,
+          source,
           author: { human: humanName(env), agent: agent_label?.trim() || null },
         });
         return json({ id: note.id, type: note.type, title: note.title, author: note.author, created: note.created, file: note.file });
@@ -116,13 +133,16 @@ export function buildServer(dir: string, env: NodeJS.ProcessEnv = process.env): 
   const recallDescription =
     "Read the team brain before you act. Returns active notes (superseded ones are excluded) matching the query by title or body, plus every note's backlinks with surrounding context so you see how facts connect. " +
     confidenceExplainer +
-    " The response also carries an `open_tasks` section: open tasks addressed to your agent_label (or to any agent), so pass your label and you will discover waiting work naturally. Call this at the start of a task, before making a decision the team may have already made, and before writing code in an area with known gotchas.";
+    " The response also carries `conventions`: EVERY active convention note, verbatim, regardless of your query; these are the team's standing rules, so apply these to your work. It also carries an `open_tasks` section: open tasks addressed to your agent_label (or to any agent), so pass your label and you will discover waiting work naturally. Call this at the start of a task, before making a decision the team may have already made, and before writing code in an area with known gotchas.";
 
   const runRecall = (opts: RecallOptions, agentLabel?: string | null) => {
     const brain = loadBrain(dir);
     const results = recall(brain, opts);
     const openTasks = openTasksFor(brain, agentLabel).map((t) => taskView(t));
-    return json({ count: results.length, notes: results, open_tasks: openTasks });
+    // conventions ride every recall verbatim: standing rules apply to all
+    // work, not just work that happened to search for them
+    const conventions = activeConventions(brain).map((n) => ({ id: n.id, title: n.title, body: n.body }));
+    return json({ count: results.length, notes: results, conventions, open_tasks: openTasks });
   };
 
   server.registerTool(
@@ -164,15 +184,18 @@ export function buildServer(dir: string, env: NodeJS.ProcessEnv = process.env): 
         type: typeField,
         title: z.string().describe("Title for the replacement note. Keep the old title if the fact is the same, just corrected."),
         body: z.string().describe("Markdown. Include what changed since the old note and the evidence for the correction."),
+        source: sourceField,
         agent_label: agentLabelField,
       },
     },
-    async ({ old_id, type, title, body, agent_label }) => {
+    async ({ old_id, type, title, body, source, agent_label }) => {
       try {
+        assertNotLocked(dir);
         const { oldNote, newNote } = supersedeNote(dir, old_id, {
           type: type as NoteType,
           title,
           body,
+          source,
           author: { human: humanName(env), agent: agent_label?.trim() || null },
         });
         return json({
@@ -226,6 +249,7 @@ export function buildServer(dir: string, env: NodeJS.ProcessEnv = process.env): 
     },
     async ({ ids, reason }) => {
       try {
+        assertNotLocked(dir);
         const credited = creditNotes(dir, ids);
         return json({
           credited: credited.map((n) => ({
@@ -258,15 +282,18 @@ export function buildServer(dir: string, env: NodeJS.ProcessEnv = process.env): 
           .string()
           .optional()
           .describe('Agent label to address, e.g. "codex". Omit to let any agent take it. Labels match case-insensitively.'),
+        source: sourceField,
         agent_label: agentLabelField,
       },
     },
-    async ({ title, instructions, assigned_to, agent_label }) => {
+    async ({ title, instructions, assigned_to, source, agent_label }) => {
       try {
+        assertNotLocked(dir);
         const task = assignTask(dir, {
           title,
           instructions,
           assigned_to: assigned_to?.trim() || null,
+          source,
           author: { human: humanName(env), agent: agent_label?.trim() || null },
         });
         return json({ task: taskView(task), file: task.file });
@@ -313,8 +340,37 @@ export function buildServer(dir: string, env: NodeJS.ProcessEnv = process.env): 
     },
     async ({ id, agent_label }) => {
       try {
+        assertNotLocked(dir);
         const task = claimTask(dir, id, agent_label);
         return json({ task: taskView(task) });
+      } catch (e) {
+        return errorResult(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "abandon_task",
+    {
+      title: "Abandon a claimed task, with the reason on the record",
+      description:
+        "Give up on a task you claimed but cannot complete (it needs tools or access you do not have, or repeated attempts failed). The task goes back to open with claimed_by cleared, so another agent can take it, and your reason is recorded on the task's abandon_reason field: always hand a task back loudly rather than leaving it to rot, because the assigner needs to know WHY it came back. Failure visibility is the point. Only the claimer may abandon; the reason is cleared when someone claims the task next.",
+      inputSchema: {
+        id: z.string().describe("The task's note id."),
+        reason: z
+          .string()
+          .describe("Why you are handing the task back: what you tried, what blocked you, what the next claimer should know."),
+        agent_label: requiredLabelField,
+      },
+    },
+    async ({ id, reason, agent_label }) => {
+      try {
+        assertNotLocked(dir);
+        const task = abandonTask(dir, id, reason, agent_label);
+        return json({
+          task: taskView(task),
+          message: "Task returned to open with your reason on the record. Another agent can now claim it.",
+        });
       } catch (e) {
         return errorResult(e);
       }
@@ -339,6 +395,7 @@ export function buildServer(dir: string, env: NodeJS.ProcessEnv = process.env): 
     },
     async ({ id, result, helped_note_ids, agent_label }) => {
       try {
+        assertNotLocked(dir);
         const task = completeTask(dir, id, result, agent_label);
         const helped = helped_note_ids ?? [];
         const credited = helped.length > 0 ? creditNotes(dir, helped) : [];

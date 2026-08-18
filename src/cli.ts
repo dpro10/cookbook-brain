@@ -13,6 +13,7 @@
  * The brain directory resolves as: --dir flag, then the BRAIN_DIR environment
  * variable, then ./brain.
  */
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import {
@@ -45,6 +46,10 @@ Commands:
 Options:
   --dir <path>   brain directory (default ./brain; BRAIN_DIR env also works)
   --apply        dream: execute proposals the refuter kept (default: report-only)
+  --commit       dream: after a successful apply, git commit the brain directory
+                 (only paths under it); requires --apply and a git repo
+  --json         dream: print a machine-readable JSON report to stdout
+                 (the markdown report file is still written)
   --model <id>   dream: model id passed to claude -p --model (default: your claude setting)
   --dry-digest   dream: print exactly what would be sent to the model, then exit
   --help         show this help
@@ -74,13 +79,12 @@ author:
   agent: Claude Code
 created: 2026-08-18T17:20:00.000Z
 supersedes: null
+source: https://vercel.com/docs/rewrites
 credits: 0
 last_credited: null
 ---
 Rewrites in vercel.json silently drop the trailing slash before matching,
 so a rule targeting /docs/ never fires. Match /docs instead.
-
-source: https://vercel.com/docs/rewrites
 
 Related: [[Docs routing decision]]
 \`\`\`
@@ -96,6 +100,10 @@ The fields:
   themselves.
 - **created**: ISO timestamp.
 - **supersedes**: the id of the note this one replaces, or \`null\`.
+- **source**: optional citation for where the fact comes from: a URL, a file
+  path, a ticket id. Cited memory is auditable memory: a note with a
+  \`source\` field earns the sourced-agent confidence cap (0.85), exactly
+  like the body heuristic below. Omit the field rather than leaving it blank.
 - **consolidates**: merge and promotion notes written by \`dream\` only: the
   ids of the notes this one consolidated, as a \`[bracketed, list]\`. Each
   consolidated note has its \`superseded_by\` stamped to point at this note.
@@ -112,6 +120,9 @@ instructions; the frontmatter holds its lifecycle:
   meaning any agent may take it. Labels match case-insensitively.
 - **claimed_by**: the agent label that claimed the task, or \`null\`.
 - **result**: a short outcome string stamped on completion, or \`null\`.
+- **abandon_reason**: present only after a claimed task was abandoned: why
+  the claimer handed it back. Cleared on the next claim; the reason survives
+  in git history.
 
 ## Confidence
 
@@ -120,9 +131,9 @@ Recall scores every note with a public formula:
     score = clamp(cap - 0.10 + 0.05 * min(credits, 3) - staleness, 0.20, cap)
 
 - **cap** is the provenance ceiling: 0.95 for a human-written note, 0.85 for
-  an agent note citing a source (a \`source:\` line or a URL in the body),
-  0.60 for a bare agent claim. No amount of crediting lifts a note past its
-  cap.
+  an agent note citing a source (the \`source\` frontmatter field, a
+  \`source:\` line, or a URL in the body), 0.60 for a bare agent claim. No
+  amount of crediting lifts a note past its cap.
 - Each credit lifts the score by 0.05, up to three credits; a fresh
   uncredited note sits 0.10 under its cap.
 - **staleness** is 0.05 per full 90 days since \`last_credited\` (or
@@ -153,9 +164,9 @@ place: \`credits\` and \`last_credited\`, written when work that relied on a
 note verifiably completed. That credit pair is the second sanctioned
 mutation of an existing file, alongside the \`superseded_by\` stamp described
 above. Task notes allow a third stamp set, on task-type notes only:
-\`status\`, \`claimed_by\`, and \`result\`, which move a task through its
-lifecycle. Nothing else about an existing file is ever touched, and no stamp
-ever changes a body.
+\`status\`, \`claimed_by\`, \`result\`, and \`abandon_reason\`, which move a
+task through its lifecycle. Nothing else about an existing file is ever
+touched, and no stamp ever changes a body.
 
 Superseded notes are excluded from recall by default.
 
@@ -168,7 +179,9 @@ anything is applied (and nothing is applied without \`--apply\`). Notes a
 dream writes are authored \`{ human: <brain owner>, agent: "dream" }\`, so
 the bare-agent provenance cap applies: the brain distrusts its own dreams
 until work proves them. Dream reports live in the \`dreams/\` subdirectory,
-which the note scanner never reads.
+which the note scanner never reads. While a dream applies its changes it
+holds a \`.lock\` file in this directory; write tools wait it out, reads
+never block, and a lock older than ten minutes is stale and ignored.
 
 ## Git
 
@@ -185,6 +198,8 @@ interface Args {
   limit: number;
   /** dream only */
   apply: boolean;
+  commit: boolean;
+  json: boolean;
   model?: string;
   dryDigest: boolean;
 }
@@ -196,7 +211,7 @@ function fail(msg: string): never {
 }
 
 function parseArgs(argv: string[]): Args {
-  const args: Args = { command: null, rest: [], dir: "", limit: 20, apply: false, dryDigest: false };
+  const args: Args = { command: null, rest: [], dir: "", limit: 20, apply: false, commit: false, json: false, dryDigest: false };
   let dirFlag: string | undefined;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -212,6 +227,10 @@ function parseArgs(argv: string[]): Args {
       args.limit = n;
     } else if (a === "--apply") {
       args.apply = true;
+    } else if (a === "--commit") {
+      args.commit = true;
+    } else if (a === "--json") {
+      args.json = true;
     } else if (a === "--dry-digest") {
       args.dryDigest = true;
     } else if (a === "--model") {
@@ -317,6 +336,9 @@ function cmdTasks(dir: string): void {
           : "for any agent";
     console.log(`  ${t.id}  ${(t.status ?? "open").padEnd(7)}  ${t.title}`);
     console.log(`  ${" ".repeat(t.id.length)}  ${" ".repeat(7)}  ${who}, ${ageDays(t.created)}`);
+    if (t.abandon_reason != null) {
+      console.log(`  ${" ".repeat(t.id.length)}  ${" ".repeat(7)}  abandoned earlier: ${t.abandon_reason}`);
+    }
   }
 }
 
@@ -336,8 +358,38 @@ function cmdDoctor(dir: string): void {
   process.exit(1);
 }
 
+interface CommitResult {
+  committed: boolean;
+  note: string;
+}
+
+/**
+ * dream --commit: after a successful apply, commit ONLY paths under the
+ * brain directory, so a repo dirty elsewhere never gets swept into the dream
+ * commit. Non-fatal on every failure path: the dream and its report already
+ * happened; the commit is bookkeeping.
+ */
+function commitBrainDir(dir: string, appliedCount: number, now: Date): CommitResult {
+  const git = (cmdArgs: string[]) => spawnSync("git", cmdArgs, { cwd: dir, encoding: "utf8", timeout: 30_000 });
+  const inRepo = git(["rev-parse", "--is-inside-work-tree"]);
+  if (inRepo.status !== 0 || inRepo.stdout.trim() !== "true") {
+    return { committed: false, note: "not committed: the brain directory is not inside a git repository" };
+  }
+  const add = git(["add", "-A", "--", "."]);
+  if (add.status !== 0) {
+    return { committed: false, note: `not committed: git add failed: ${(add.stderr ?? "").trim().slice(0, 300)}` };
+  }
+  const message = `dream: ${now.toISOString().slice(0, 10)} applied ${appliedCount} proposals`;
+  const commit = git(["commit", "-m", message, "--", "."]);
+  if (commit.status !== 0) {
+    return { committed: false, note: `not committed: git commit failed: ${(commit.stderr ?? commit.stdout ?? "").trim().slice(0, 300)}` };
+  }
+  return { committed: true, note: `committed the brain directory: "${message}"` };
+}
+
 async function cmdDream(args: Args): Promise<void> {
   if (!fs.existsSync(args.dir)) fail(`no brain directory at ${args.dir} (run: cookbook-brain init)`);
+  if (args.commit && !args.apply) fail("--commit requires --apply (a report-only dream changes nothing to commit)");
   const { buildDigest, dream, findClaudeBinary, hygieneFindings, proposerPrompt } = await import("./dream.ts");
 
   if (args.dryDigest) {
@@ -360,18 +412,60 @@ async function cmdDream(args: Args): Promise<void> {
   }
 
   const outcome = dream({ dir: args.dir, apply: args.apply, model: args.model, human: humanName() });
+  const appliedOk = outcome.applied.filter((a) => a.ok).length;
+
+  let commit: CommitResult | null = null;
+  if (args.commit) {
+    commit =
+      appliedOk > 0
+        ? commitBrainDir(args.dir, appliedOk, new Date())
+        : { committed: false, note: "not committed: nothing was applied, so there is nothing to commit" };
+  }
+
+  if (args.json) {
+    // machine-readable report on stdout, and nothing else
+    process.stdout.write(
+      JSON.stringify(
+        {
+          date: new Date().toISOString(),
+          brain: args.dir,
+          mode: args.apply ? "apply" : "report-only",
+          active_notes: outcome.activeCount,
+          hygiene_findings: outcome.hygieneTotal,
+          proposals: outcome.proposals,
+          refuter_ran: outcome.refuterRan,
+          verdicts: outcome.verdicts,
+          skipped_review: outcome.skippedReview,
+          kept: outcome.keptCount,
+          applied: outcome.applied,
+          lock_note: outcome.lockNote,
+          commit,
+          report_file: outcome.reportFile,
+        },
+        null,
+        2,
+      ) + "\n",
+    );
+    return;
+  }
+
   console.log(`cookbook-brain dream: ${outcome.activeCount} active note(s) digested, ${outcome.hygieneTotal} hygiene finding(s)`);
   console.log(
     `proposals: ${outcome.proposals.length} (${outcome.keptCount} kept)  refuter: ${outcome.refuterRan ? "ran" : "absent"}`,
   );
+  if (outcome.skippedReview.length > 0) {
+    console.log(`not reviewed (too large for the refuter prompt cap): proposal ${outcome.skippedReview.join(", proposal ")}`);
+  }
+  if (outcome.lockNote) console.log(`lock: ${outcome.lockNote}`);
   if (!args.apply) {
     console.log("applied: nothing (report-only run; re-run with --apply to execute kept proposals)");
   } else if (!outcome.refuterRan) {
     console.log("applied: nothing (the refuter was absent, and unreviewed dreams are never applied)");
   } else {
-    console.log(`applied: ${outcome.applied.filter((a) => a.ok).length} change(s)`);
+    console.log(`applied: ${appliedOk} change(s)`);
     for (const a of outcome.applied) console.log(`  ${a.ok ? "ok " : "FAIL"} ${a.description}`);
   }
+  if (commit) console.log(`commit: ${commit.note}`);
   console.log(`report: ${outcome.reportFile}`);
 }
 

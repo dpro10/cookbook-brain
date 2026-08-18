@@ -30,7 +30,9 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import {
+  LOCK_STALE_MS,
   NOTE_TYPES,
+  acquireLock,
   activeNotes,
   confidenceFor,
   consolidateNotes,
@@ -38,6 +40,7 @@ import {
   duplicateActiveTitleGroups,
   extractWikilinks,
   loadBrain,
+  releaseLock,
   supersedeNote,
   tierFor,
   type Author,
@@ -393,26 +396,64 @@ export function proposerPrompt(digestText: string, hygiene: HygieneFindings): st
   ].join("\n");
 }
 
-export function refuterPrompt(proposals: Proposal[], brain: Brain): string {
-  const lines = [
-    "You are the REFUTER reviewing consolidation proposals made over an agent memory. The proposals were produced by a separate pass; you have no memory of writing them and no loyalty to them.",
-    "Your job is adversarial: reject any proposal that loses information, merges notes that do not state the same fact, promotes something unproven, flags a contradiction that is not one, or picks a worse title. The full text of every source note is below; judge against the notes themselves, not the proposal's own claims.",
-    "",
-    "Respond with ONLY a JSON object, no prose and no code fences:",
-    '{"verdicts": [{"index": <proposal index>, "verdict": "keep" or "reject", "reason": "<200 characters or fewer>"}]}',
-    "Give a verdict for EVERY proposal index listed below. Do not use any tools.",
-    "",
-  ];
-  proposals.forEach((p, i) => {
-    lines.push(`PROPOSAL ${i}:`, JSON.stringify(p), "", `SOURCE NOTES FOR PROPOSAL ${i}:`);
-    for (const id of sourceIdsOf(p)) {
-      const note = brain.byId.get(id);
-      lines.push(`--- note ${id} (${note ? path.basename(note.file) : "missing"}) ---`);
-      lines.push(note ? fs.readFileSync(note.file, "utf8").trim() : "(missing)");
-    }
-    lines.push("");
-  });
+const REFUTER_HEADER_LINES = [
+  "You are the REFUTER reviewing consolidation proposals made over an agent memory. The proposals were produced by a separate pass; you have no memory of writing them and no loyalty to them.",
+  "Your job is adversarial: reject any proposal that loses information, merges notes that do not state the same fact, promotes something unproven, flags a contradiction that is not one, or picks a worse title. The full text of every source note is below; judge against the notes themselves, not the proposal's own claims.",
+  "",
+  "Respond with ONLY a JSON object, no prose and no code fences:",
+  '{"verdicts": [{"index": <proposal index>, "verdict": "keep" or "reject", "reason": "<200 characters or fewer>"}]}',
+  "Give a verdict for EVERY proposal index listed below. Do not use any tools.",
+  "",
+];
+
+/** One proposal's section of the refuter prompt: the proposal JSON plus the full text of its source notes. */
+function refuterSection(p: Proposal, index: number, brain: Brain): string {
+  const lines = [`PROPOSAL ${index}:`, JSON.stringify(p), "", `SOURCE NOTES FOR PROPOSAL ${index}:`];
+  for (const id of sourceIdsOf(p)) {
+    const note = brain.byId.get(id);
+    lines.push(`--- note ${id} (${note ? path.basename(note.file) : "missing"}) ---`);
+    lines.push(note ? fs.readFileSync(note.file, "utf8").trim() : "(missing)");
+  }
+  lines.push("");
   return lines.join("\n");
+}
+
+export function refuterPrompt(proposals: Proposal[], brain: Brain): string {
+  return [...REFUTER_HEADER_LINES, ...proposals.map((p, i) => refuterSection(p, i, brain))].join("\n");
+}
+
+/** The refuter prompt size ceiling, in characters. Everything the refuter reviews must fit under it. */
+export const REFUTER_PROMPT_CHAR_CAP = 24_000;
+
+/**
+ * Pick which proposals fit under the refuter prompt size cap. When the whole
+ * prompt would overflow, the LARGEST proposals (proposal JSON plus full
+ * source-note text) are dropped from review first, because one bloated
+ * proposal should not crowd out several reviewable ones. Dropped proposals
+ * are recorded as "not reviewed: too large" and, since unreviewed proposals
+ * are never applied, they are rejected. Both returned lists are in original
+ * proposal-index order.
+ */
+export function planReview(
+  proposals: Proposal[],
+  brain: Brain,
+  cap: number = REFUTER_PROMPT_CHAR_CAP,
+): { reviewed: number[]; skipped: number[] } {
+  const headerSize = REFUTER_HEADER_LINES.join("\n").length;
+  const sizes = proposals.map((p, i) => refuterSection(p, i, brain).length + 1);
+  const reviewed = new Set(proposals.map((_, i) => i));
+  let total = headerSize + sizes.reduce((a, b) => a + b, 0);
+  while (total > cap && reviewed.size > 0) {
+    let largest = -1;
+    for (const i of reviewed) {
+      if (largest === -1 || sizes[i] > sizes[largest]) largest = i;
+    }
+    reviewed.delete(largest);
+    total -= sizes[largest];
+  }
+  const reviewedList = [...reviewed].sort((a, b) => a - b);
+  const skipped = proposals.map((_, i) => i).filter((i) => !reviewed.has(i));
+  return { reviewed: reviewedList, skipped };
 }
 
 // ---- refuter verdict parsing ----
@@ -473,6 +514,14 @@ function applyProposal(dir: string, p: Proposal, author: Author): string {
       const brain = loadBrain(dir);
       const a = brain.byId.get(p.ids[0])!;
       const b = brain.byId.get(p.ids[1])!;
+      // dedupe: if an active open_thread already references both notes by id,
+      // the contradiction is already on record; do not file it twice.
+      const existing = activeNotes(brain).find(
+        (n) => n.type === "open_thread" && n.body.includes(p.ids[0]) && n.body.includes(p.ids[1]),
+      );
+      if (existing) {
+        return `skipped filing contradiction: active open_thread "${existing.title}" (${existing.id}) already references both notes`;
+      }
       const title = `Contradiction: ${a.title} vs ${b.title}`.slice(0, 120);
       const body = [
         `The dream refuter kept this contradiction flag: ${p.reason}`,
@@ -510,8 +559,14 @@ export interface DreamOutcome {
   hygieneTotal: number;
   proposals: Proposal[];
   refuterRan: boolean;
+  /** one verdict per proposal (empty when the refuter never ran and nothing was size-skipped) */
+  verdicts: Verdict[];
+  /** original indexes of proposals dropped from review by the refuter prompt size cap */
+  skippedReview: number[];
   keptCount: number;
   applied: AppliedChange[];
+  /** lock trouble or a stale-lock override warning, when either happened */
+  lockNote: string | null;
 }
 
 export function dream(opts: DreamOptions): DreamOutcome {
@@ -545,37 +600,76 @@ export function dream(opts: DreamOptions): DreamOutcome {
   let refuterRan = false;
   let refuterNote: string | null = null;
   let verdicts: Verdict[] = [];
+  let skippedReview: number[] = [];
   if (proposals.length === 0) {
     refuterNote = "not consulted: no proposals survived to review";
   } else {
-    const refuterCall = runClaude(refuterPrompt(proposals, brain), {
-      model: opts.model,
-      maxOutputTokens: REFUTER_MAX_OUTPUT_TOKENS,
-      timeoutMs: REFUTER_TIMEOUT_MS,
+    // size guard: the refuter prompt must fit under the character cap;
+    // overflow drops the largest proposals from review, and unreviewed
+    // proposals are never applied.
+    const plan = planReview(proposals, brain);
+    skippedReview = plan.skipped;
+    const skippedVerdict = (): Verdict => ({
+      verdict: "reject",
+      reason: `not reviewed: too large (the refuter prompt is capped at ${REFUTER_PROMPT_CHAR_CAP} characters), and unreviewed proposals are never applied`,
+      defaulted: true,
     });
-    if (!refuterCall.ok) {
-      refuterNote = `refuter call failed: ${refuterCall.error}`;
+    if (plan.reviewed.length === 0) {
+      refuterNote = "not consulted: every proposal was too large for the refuter prompt size cap; unreviewed proposals are never applied";
+      verdicts = proposals.map(skippedVerdict);
     } else {
-      const parsedVerdicts = parseVerdicts(extractJson(refuterCall.stdout), proposals.length);
-      if (parsedVerdicts === null) {
-        refuterNote = "refuter output was not parseable; every proposal is unreviewed";
+      const reviewedProposals = plan.reviewed.map((i) => proposals[i]);
+      const refuterCall = runClaude(refuterPrompt(reviewedProposals, brain), {
+        model: opts.model,
+        maxOutputTokens: REFUTER_MAX_OUTPUT_TOKENS,
+        timeoutMs: REFUTER_TIMEOUT_MS,
+      });
+      if (!refuterCall.ok) {
+        refuterNote = `refuter call failed: ${refuterCall.error}`;
       } else {
-        refuterRan = true;
-        verdicts = parsedVerdicts;
+        const parsedVerdicts = parseVerdicts(extractJson(refuterCall.stdout), reviewedProposals.length);
+        if (parsedVerdicts === null) {
+          refuterNote = "refuter output was not parseable; every proposal is unreviewed";
+        } else {
+          refuterRan = true;
+          verdicts = proposals.map(skippedVerdict);
+          plan.reviewed.forEach((originalIndex, reviewedIndex) => {
+            verdicts[originalIndex] = parsedVerdicts[reviewedIndex];
+          });
+        }
       }
     }
   }
 
   const keptIndexes = verdicts.map((v, i) => (v.verdict === "keep" ? i : -1)).filter((i) => i !== -1);
 
-  // apply: only with --apply, and NEVER when the refuter was absent
+  // apply: only with --apply, and NEVER when the refuter was absent. The
+  // brain lock is held for the duration of the writes so MCP write tools in
+  // other processes do not interleave with the consolidation.
   const applied: AppliedChange[] = [];
-  if (opts.apply && refuterRan) {
-    for (const i of keptIndexes) {
+  let lockNote: string | null = null;
+  if (opts.apply && refuterRan && keptIndexes.length > 0) {
+    let locked = false;
+    try {
+      const { overrodeStale } = acquireLock(opts.dir, now);
+      locked = true;
+      if (overrodeStale) {
+        lockNote = `warning: overrode a stale brain lock (older than ${LOCK_STALE_MS / 60000} minutes, likely a crashed apply)`;
+      }
+    } catch (e) {
+      lockNote = `could not take the brain lock: ${(e as Error).message}. Nothing was applied; re-run once the other apply finishes.`;
+    }
+    if (locked) {
       try {
-        applied.push({ index: i, ok: true, description: applyProposal(opts.dir, proposals[i], author) });
-      } catch (e) {
-        applied.push({ index: i, ok: false, description: `failed to apply: ${(e as Error).message}` });
+        for (const i of keptIndexes) {
+          try {
+            applied.push({ index: i, ok: true, description: applyProposal(opts.dir, proposals[i], author) });
+          } catch (e) {
+            applied.push({ index: i, ok: false, description: `failed to apply: ${(e as Error).message}` });
+          }
+        }
+      } finally {
+        releaseLock(opts.dir);
       }
     }
   }
@@ -594,7 +688,9 @@ export function dream(opts: DreamOptions): DreamOutcome {
     refuterRan,
     refuterNote,
     verdicts,
+    skippedReview,
     applied,
+    lockNote,
   });
   const reportFile = writeReport(opts.dir, now, reportText);
 
@@ -605,8 +701,11 @@ export function dream(opts: DreamOptions): DreamOutcome {
     hygieneTotal: hygieneCount(hygiene),
     proposals,
     refuterRan,
+    verdicts,
+    skippedReview,
     keptCount: keptIndexes.length,
     applied,
+    lockNote,
   };
 }
 
@@ -626,7 +725,9 @@ interface ReportInput {
   refuterRan: boolean;
   refuterNote: string | null;
   verdicts: Verdict[];
+  skippedReview: number[];
   applied: AppliedChange[];
+  lockNote: string | null;
 }
 
 function renderReport(r: ReportInput): string {
@@ -669,6 +770,11 @@ function renderReport(r: ReportInput): string {
   lines.push("## Refuter review", "");
   lines.push(r.refuterRan ? "refuter: ran" : "refuter: absent");
   lines.push("");
+  if (r.skippedReview.length > 0) {
+    lines.push(
+      `- ${r.skippedReview.length} proposal(s) dropped from review by the prompt size cap (proposal ${r.skippedReview.join(", proposal ")}): not reviewed, so never applied.`,
+    );
+  }
   if (r.refuterRan) {
     r.verdicts.forEach((v, i) => {
       lines.push(`- proposal ${i}: ${v.verdict}. ${v.reason}${v.defaulted ? " (defaulted)" : ""}`);
@@ -679,12 +785,13 @@ function renderReport(r: ReportInput): string {
   }
 
   lines.push("", "## Applied", "");
+  if (r.lockNote) lines.push(`- ${r.lockNote}`);
   if (!r.apply) {
     lines.push("report-only run: nothing was applied. Re-run with --apply to execute the kept proposals.");
   } else if (!r.refuterRan) {
     lines.push("nothing applied: the refuter was absent, and unreviewed dreams are never applied.");
   } else if (r.applied.length === 0) {
-    lines.push("no proposals were kept, so there was nothing to apply.");
+    if (!r.lockNote) lines.push("no proposals were kept, so there was nothing to apply.");
   } else {
     for (const a of r.applied) {
       lines.push(`- proposal ${a.index}${a.ok ? "" : " (FAILED)"}: ${a.description}`);
