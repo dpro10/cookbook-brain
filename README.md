@@ -251,6 +251,14 @@ SORT assigned_to ASC
 
 `npx cookbook-brain index` generates `INDEX.md` at the brain root: every active note as a wikilink, grouped by type with conventions first, each with its tier and credits. It makes a good vault homepage; it is a view, not a note, so regenerating overwrites it and the scanner ignores it. And for the one thing Obsidian does not show, the live confidence and tier math, run `npx cookbook-brain web`: a read-only viewer at `http://127.0.0.1:4321` with confidence bars, tier badges, the task board, and the dream and harvest reports.
 
+## When your team is ready
+
+Your brain and cookbook.team speak the same language: the same note types, the same tiers, the same source discipline, the same task verbs. So migration is one instruction to an agent connected to both: read every active note in my brain and remember it into my team workspace, same type, title, body, and source. Attribution carries. Your conventions start riding every teammate's recall the moment they land.
+
+Credits do not migrate, deliberately: team confidence is earned from team outcomes, and imported claims start at cited-agent trust until the team's work proves them. The distrust-until-proven principle applies to migration itself.
+
+Keep the brain after you upgrade. Many people will want both: the brain for personal context, the workspace for team context. They are altitudes, not rivals.
+
 ## Acknowledgments and the honest map
 
 Mem0, Zep, and Letta are excellent hosted/infra memory layers with capabilities this tool does not have (managed scale, temporal graphs, enterprise features). QM ships scoped per-person memory for teams. cookbook-brain differs on three axes: your memory is files you own rather than rows in a service, every note is attributed and append-only, and confidence is earned from outcomes rather than asserted at write time. If you want a managed memory API, use them. If you want a brain you can read, use this.
