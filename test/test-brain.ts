@@ -51,6 +51,23 @@ import {
   type Note,
 } from "../src/store.ts";
 import { REFUTER_PROMPT_CHAR_CAP, buildDigest, extractJson, hygieneFindings, planReview, type Proposal } from "../src/dream.ts";
+import {
+  HARVEST_DIGEST_CHAR_BUDGET,
+  HARVEST_PROMPT_CHAR_CAP,
+  SESSION_DIGEST_CHAR_CAP,
+  buildHarvestDigest,
+  dedupeAgainstBrain,
+  digestSession,
+  harvestProposerPrompt,
+  harvestRefuterPrompt,
+  planHarvestReview,
+  scanSessions,
+  trigramOverlap,
+  validateHarvestProposals,
+  wordTrigrams,
+  type HarvestProposal,
+  type ScannedSession,
+} from "../src/harvest.ts";
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 const BASIC = path.join(ROOT, "test", "fixtures", "basic-brain");
@@ -2131,6 +2148,556 @@ async function mcpV4FeatureTest(): Promise<void> {
 }
 
 await mcpV4FeatureTest();
+
+// ---- v0.5: harvest ----
+
+/** Harvest fixtures live against the real clock: the CLI path has no injectable now. */
+const HNOW = Date.now();
+const hIso = (daysOld: number, minutes = 0) => new Date(HNOW - daysOld * DAY + minutes * 60_000).toISOString();
+
+function writeJsonl(file: string, entries: unknown[], extraRawLines: string[] = []): void {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, [...entries.map((e) => JSON.stringify(e)), ...extraRawLines].join("\n") + "\n");
+}
+
+/**
+ * A fabricated transcript tree in the real ~/.claude/projects shape:
+ * encoded project dirs, top-level <sessionId>.jsonl files, one subagents/
+ * transcript that harvest must skip, tool-noise entries to skip, a malformed
+ * line, and one session outside the day window.
+ */
+function makeSessionsRoot(): string {
+  const root = tmpdir("brain-sessions-");
+  const app = path.join(root, "-Users-diego-Desktop-cookbook-app");
+  const cwdApp = "/Users/diego/Desktop/cookbook-app";
+  writeJsonl(
+    path.join(app, "sess-aaaa-1111.jsonl"),
+    [
+      { type: "user", timestamp: hIso(1, 0), cwd: cwdApp, sessionId: "sess-aaaa-1111", message: { role: "user", content: "Switch the poll interval to 30 seconds because free tiers rate limit below that." } },
+      { type: "user", timestamp: hIso(1, 1), cwd: cwdApp, isMeta: true, message: { role: "user", content: "META_NOISE_MUST_NOT_APPEAR in any digest" } },
+      { type: "user", timestamp: hIso(1, 2), cwd: cwdApp, message: { role: "user", content: "<command-name>/clear</command-name>" } },
+      { type: "user", timestamp: hIso(1, 3), cwd: cwdApp, message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "TOOL_RESULT_NOISE_MUST_NOT_APPEAR" }] } },
+      { type: "assistant", timestamp: hIso(1, 4), cwd: cwdApp, message: { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Bash", input: { command: "echo TOOL_USE_NOISE_MUST_NOT_APPEAR" } }] } },
+      { type: "assistant", timestamp: hIso(1, 5), cwd: cwdApp, message: { role: "assistant", content: [{ type: "text", text: "ok" }] } },
+      { type: "assistant", timestamp: hIso(1, 6), cwd: cwdApp, message: { role: "assistant", content: [{ type: "text", text: "Done: the poll interval is 30 seconds everywhere, and no free tier target rate limited at that cadence in testing." }] } },
+      { type: "user", timestamp: hIso(1, 7), cwd: cwdApp, message: { role: "user", content: [{ type: "text", text: "Great. And remember we never deploy on Fridays after that outage." }] } },
+      { type: "summary", summary: "summaries are not conversation" },
+    ],
+    ["{this line is not json"],
+  );
+  // subagent transcript: agent-to-agent traffic, must be skipped entirely
+  writeJsonl(path.join(app, "sess-aaaa-1111", "subagents", "agent-1.jsonl"), [
+    { type: "user", timestamp: hIso(1, 8), cwd: cwdApp, message: { role: "user", content: "SUBAGENT_PROMPT_MUST_NOT_APPEAR: these user messages are agent-written" } },
+    { type: "assistant", timestamp: hIso(1, 9), cwd: cwdApp, message: { role: "assistant", content: [{ type: "text", text: "SUBAGENT_CONCLUSION_MUST_NOT_APPEAR even though it is over one hundred characters long, because subagents are not the human." }] } },
+  ]);
+  const other = path.join(root, "-Users-diego-Desktop-other-proj");
+  const cwdOther = "/Users/diego/Desktop/other-proj";
+  writeJsonl(path.join(other, "sess-bbbb-2222.jsonl"), [
+    { type: "user", timestamp: hIso(2, 0), cwd: cwdOther, message: { role: "user", content: "In other-proj the staging DB resets nightly at 02:00 UTC, so do not debug missing rows at 02:05." } },
+    { type: "assistant", timestamp: hIso(2, 1), cwd: cwdOther, message: { role: "assistant", content: [{ type: "text", text: "Understood: the staging database resets nightly at 02:00 UTC, so rows missing right after that window are expected rather than a bug." }] } },
+  ]);
+  // outside the 7-day window by timestamp (mtime is fresh, so the timestamp filter must catch it)
+  writeJsonl(path.join(other, "sess-old-3333.jsonl"), [
+    { type: "user", timestamp: hIso(30, 0), cwd: cwdOther, message: { role: "user", content: "OLD_SESSION_MUST_NOT_APPEAR because it is outside the window." } },
+  ]);
+  return root;
+}
+
+check("harvest scan: reads content, skips tool noise, meta, subagents, summaries, malformed lines, and old sessions", () => {
+  const root = makeSessionsRoot();
+  try {
+    const sessions = scanSessions(root, { now: HNOW, days: 7 });
+    assert.deepEqual(sessions.map((s) => s.project), ["other-proj", "cookbook-app"], "chronological order, oldest first, project from cwd basename");
+    const app = sessions[1];
+    assert.equal(app.sessionId, "sess-aaaa-1111");
+    assert.equal(app.date, hIso(1, 7).slice(0, 10), "the session date is its last activity's date");
+    assert.deepEqual(app.items.map((i) => i.role), ["human", "agent", "human"], "two substantive human messages and one long conclusion survive");
+    const digest = buildHarvestDigest(sessions);
+    assert.deepEqual(digest.dropped, [], "two small sessions fit the budget");
+    assert.ok(digest.text.includes("SESSION"), digest.text);
+    assert.ok(digest.text.includes("project cookbook-app"), digest.text);
+    assert.ok(digest.text.includes("human: Switch the poll interval to 30 seconds"), digest.text);
+    assert.ok(digest.text.includes("never deploy on Fridays"), digest.text);
+    assert.ok(digest.text.includes("agent: Done: the poll interval is 30 seconds"), digest.text);
+    assert.ok(digest.text.includes("staging DB resets nightly"), digest.text);
+    for (const banned of ["SUBAGENT", "TOOL_RESULT_NOISE", "TOOL_USE_NOISE", "META_NOISE", "OLD_SESSION", "<command-name>", "summaries are not conversation", "agent: ok"]) {
+      assert.ok(!digest.text.includes(banned), `digest must not contain ${banned}`);
+    }
+    assert.ok(digest.text.indexOf("staging DB") < digest.text.indexOf("poll interval"), "sessions must read oldest first");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+check("harvest scan: --days narrows the window and --project filters by cwd basename, case-insensitively", () => {
+  const root = makeSessionsRoot();
+  try {
+    const recent = scanSessions(root, { now: HNOW, days: 1 });
+    assert.deepEqual(recent.map((s) => s.project), ["cookbook-app"], "the 2-day-old session must leave a 1-day window");
+    const filtered = scanSessions(root, { now: HNOW, days: 7, project: "Cookbook-App" });
+    assert.deepEqual(filtered.map((s) => s.project), ["cookbook-app"], "the project filter matches case-insensitively");
+    const other = scanSessions(root, { now: HNOW, days: 7, project: "other-proj" });
+    assert.deepEqual(other.map((s) => s.sessionId), ["sess-bbbb-2222"]);
+    assert.deepEqual(scanSessions(root, { now: HNOW, days: 7, project: "no-such-project" }), []);
+    assert.deepEqual(scanSessions(path.join(root, "definitely-missing"), { now: HNOW, days: 7 }), [], "a missing root scans to empty, never throws");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+check("harvest digest: flattens whitespace, truncates long messages, and caps each session's digest", () => {
+  const base: ScannedSession = { sessionId: "s1", project: "p", date: "2026-08-17", end: hIso(1), items: [] };
+  const spaced = digestSession({ ...base, items: [{ role: "human", text: "line one\nline two   spaced" }] });
+  assert.ok(spaced.includes("human: line one line two spaced"), spaced);
+  const long = digestSession({ ...base, items: [{ role: "human", text: "x".repeat(900) }] });
+  const humanLine = long.split("\n").find((l) => l.startsWith("human:"))!;
+  assert.equal(humanLine.length, "human: ".length + 300, "human messages truncate at 300 chars");
+  const many = digestSession({ ...base, items: Array.from({ length: 12 }, (_, i) => ({ role: "human" as const, text: `message ${i} ` + "y".repeat(290) })) });
+  assert.ok(many.length <= SESSION_DIGEST_CHAR_CAP + "(session digest truncated)".length + 1, `session digest must respect its cap, got ${many.length}`);
+  assert.ok(many.includes("(session digest truncated)"), "an overflowing session must say it was truncated");
+});
+
+check("harvest digest budget: oldest sessions are dropped first and recorded; survivors stay chronological", () => {
+  const mk = (i: number): ScannedSession => ({
+    sessionId: `sess-${i}`,
+    project: "p",
+    date: hIso(6 - i).slice(0, 10),
+    end: hIso(6 - i),
+    items: [{ role: "human", text: `session number ${i} says something substantive` }],
+  });
+  const sessions = [mk(0), mk(1), mk(2)]; // oldest first
+  const full = buildHarvestDigest(sessions);
+  assert.deepEqual(full.dropped, [], "everything fits under the real budget");
+  assert.equal(full.included.length, 3);
+  const perBlock = digestSession(sessions[0]).length + 2;
+  const tight = buildHarvestDigest(sessions, perBlock * 2 + 4);
+  assert.deepEqual(tight.included.map((s) => s.sessionId), ["sess-1", "sess-2"], "the newest sessions survive");
+  assert.deepEqual(tight.dropped.map((s) => s.sessionId), ["sess-0"], "the oldest session is dropped and recorded");
+  assert.ok(tight.text.indexOf("session number 1") < tight.text.indexOf("session number 2"), "survivors stay oldest first");
+  assert.ok(HARVEST_DIGEST_CHAR_BUDGET < HARVEST_PROMPT_CHAR_CAP, "the digest budget must leave prompt headroom for review");
+});
+
+check("harvest trigrams: word trigrams and overlap behave", () => {
+  const a = wordTrigrams("The staging DB resets nightly at 02:00 UTC.");
+  assert.ok(a.has("the staging db"), [...a].join("|"));
+  assert.ok(a.has("staging db resets"));
+  assert.equal(trigramOverlap(a, a), 1, "identical texts overlap fully");
+  assert.equal(trigramOverlap(wordTrigrams("too short"), a), 0, "under three words there are no trigrams");
+  const b = wordTrigrams("The staging DB resets nightly at 02:00 UTC, so wait.");
+  assert.ok(trigramOverlap(a, b) > 0.8, String(trigramOverlap(a, b)));
+  assert.ok(trigramOverlap(a, wordTrigrams("completely different words about deployment windows and lint rules")) === 0);
+});
+
+check("harvest validation: closed type set, required fields, the 1200-char body cap, and the mandatory source line", () => {
+  const good = {
+    type: "decision",
+    title: "Poll interval is 30s",
+    body: "The human settled on 30 seconds because free tiers rate limit below that.\n\nsource: session 2026-08-17, project cookbook-app",
+  };
+  const { proposals, invalid } = validateHarvestProposals({
+    proposals: [
+      good,
+      { type: "note", title: "T", body: "b\nsource: session x" },
+      { type: "task", title: "T", body: "b\nsource: session x" },
+      { type: "merge", title: "T", body: "b\nsource: session x" },
+      { type: "gotcha", body: "no title\nsource: session x" },
+      { type: "gotcha", title: "No body" },
+      { type: "gotcha", title: "Too long", body: "z".repeat(1300) + "\nsource: session x" },
+      { type: "gotcha", title: "No citation", body: "a body with no citation at all" },
+    ],
+  });
+  assert.equal(proposals.length, 1, JSON.stringify(invalid));
+  assert.deepEqual(proposals[0], good);
+  assert.equal(invalid.length, 7);
+  const reasons = invalid.map((i) => i.reason).join("\n");
+  assert.ok(/type must be one of decision, gotcha, convention, open_thread/.test(reasons), reasons);
+  assert.ok(/missing title/.test(reasons), reasons);
+  assert.ok(/missing body/.test(reasons), reasons);
+  assert.ok(/over the 1200 cap/.test(reasons), reasons);
+  assert.ok(/must cite its session in a source: line/.test(reasons), reasons);
+  assert.deepEqual(validateHarvestProposals("not even an object").proposals, []);
+  assert.equal(validateHarvestProposals({ nope: true }).invalid[0].reason, "output has no proposals array");
+});
+
+check("harvest dedupe: title matches and >60% trigram overlap against ACTIVE notes are skipped with reasons", () => {
+  const dir = tmpdir("brain-harvest-dedupe-");
+  try {
+    const author = { human: "diego", agent: null };
+    const existing = createNote(dir, {
+      type: "decision",
+      title: "Poll interval is 30s",
+      body: "Free tier endpoints rate limit hard below thirty seconds, so the poll interval is thirty seconds for every monitored target, and we verified the limit holds across all eight targets in the fleet during testing last week.",
+      author,
+    });
+    const retired = createNote(dir, { type: "note", title: "Retired title", body: "was true once", author });
+    supersedeNote(dir, retired.id, { type: "note", title: "Retired title v2", body: "still niche", author });
+    const src = "\n\nsource: session 2026-08-17, project cookbook-app";
+    const titleDup: HarvestProposal = { type: "decision", title: "POLL INTERVAL IS 30S", body: "Different words entirely, same claim by title." + src };
+    const bodyDup: HarvestProposal = { type: "decision", title: "Polling cadence", body: existing.body + src };
+    const fresh: HarvestProposal = { type: "convention", title: "Never deploy on Fridays", body: "The team never deploys on Fridays after the August outage settled the question for good." + src };
+    const resurrected: HarvestProposal = { type: "note", title: "Retired title", body: "A superseded title is free again for new facts." + src };
+    const { kept, skipped } = dedupeAgainstBrain(loadBrain(dir), [titleDup, bodyDup, fresh, resurrected]);
+    assert.deepEqual(kept.map((p) => p.title), ["Never deploy on Fridays", "Retired title"], "superseded notes must not block a title");
+    assert.equal(skipped.length, 2);
+    assert.ok(skipped[0].reason.includes(`title matches active note "Poll interval is 30s" (${existing.id})`), skipped[0].reason);
+    assert.ok(/body shares \d+% of its trigrams with active note "Poll interval is 30s"/.test(skipped[1].reason), skipped[1].reason);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+check("harvest planHarvestReview: same guard as dream's, largest proposals dropped first, base includes the digests", () => {
+  const src = "\n\nsource: session 2026-08-17, project x";
+  const small: HarvestProposal = { type: "decision", title: "Small", body: "short body" + src };
+  const big: HarvestProposal = { type: "decision", title: "Big", body: "x".repeat(3000) + src };
+  const digestText = "SESSION 2026-08-17, project x\nhuman: something";
+  const base = harvestRefuterPrompt([], digestText).length;
+  const smallSize = harvestRefuterPrompt([small], digestText).length - base;
+  const cap = base + smallSize + 2;
+  assert.deepEqual(planHarvestReview([small, big], digestText, HARVEST_PROMPT_CHAR_CAP), { reviewed: [0, 1], skipped: [] }, "both fit the real cap");
+  assert.deepEqual(planHarvestReview([big, small], digestText, cap), { reviewed: [1], skipped: [0] }, "the largest is dropped first");
+  assert.deepEqual(planHarvestReview([small, big], digestText, cap), { reviewed: [0], skipped: [1] }, "index order does not matter, size does");
+  assert.deepEqual(planHarvestReview([big], digestText, base), { reviewed: [], skipped: [0] }, "when nothing fits, nothing is reviewed");
+  assert.ok(harvestProposerPrompt(digestText).includes("You are the HARVESTER"));
+  assert.ok(harvestRefuterPrompt([small], digestText).includes("You are the REFUTER"));
+});
+
+// ---- v0.5: harvest CLI end-to-end over a fake claude shim on PATH ----
+
+/**
+ * The fake `claude` binary for harvest runs. Hermetic, same pattern as the
+ * dream shim: it tells proposer from refuter by the prompt text on stdin,
+ * modes ride FAKE_CLAUDE_MODE, and the proposal payload rides
+ * FAKE_HARVEST_PROPOSALS as JSON.
+ */
+const HARVEST_SHIM_SOURCE = `#!/usr/bin/env node
+const fs = require("fs");
+const input = fs.readFileSync(0, "utf8");
+const mode = process.env.FAKE_CLAUDE_MODE || "wellformed";
+const isRefuter = input.includes("You are the REFUTER");
+if (process.env.FAKE_CLAUDE_LOG) {
+  fs.appendFileSync(
+    process.env.FAKE_CLAUDE_LOG,
+    JSON.stringify({ role: isRefuter ? "refuter" : "proposer", args: process.argv.slice(2), maxTokens: process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS || null }) + "\\n",
+  );
+}
+const out = (s) => process.stdout.write(s);
+if (!isRefuter) {
+  if (mode === "proposer-garbage") { out("The sessions were lovely but I will not answer in JSON."); process.exit(0); }
+  const proposals = process.env.FAKE_HARVEST_PROPOSALS
+    ? JSON.parse(process.env.FAKE_HARVEST_PROPOSALS)
+    : [
+        { type: "decision", title: "Poll interval is 30s", body: "The human settled on a 30 second poll interval because free tiers rate limit below that. It held in testing.\\n\\nsource: session 2026-08-17, project cookbook-app" },
+        { type: "convention", title: "Never deploy on Fridays", body: "The human said the team never deploys on Fridays after the outage. Treat it as a standing rule.\\n\\nsource: session 2026-08-17, project cookbook-app" },
+      ];
+  out("Distilled:\\n\`\`\`json\\n" + JSON.stringify({ proposals }) + "\\n\`\`\`\\n");
+  process.exit(0);
+}
+if (mode === "refuter-garbage") { out("I would rather review the weather than these notes."); process.exit(0); }
+const indexes = [...input.matchAll(/^PROPOSAL (\\d+):/gm)].map((m) => Number(m[1]));
+let verdicts;
+if (mode === "refuter-rejects-some") {
+  verdicts = indexes
+    .map((i) => {
+      if (i === 0) return { index: 0, verdict: "keep", reason: "The digests support it." };
+      if (i === 1) return { index: 1, verdict: "reject", reason: "The digests never show this decision being made." };
+      return null;
+    })
+    .filter(Boolean);
+} else {
+  verdicts = indexes.map((i) => ({ index: i, verdict: "keep", reason: "Supported by the session digests." }));
+}
+out(JSON.stringify({ verdicts }) + "\\n");
+`;
+
+const harvestShimDir = tmpdir("brain-harvest-shim-");
+fs.writeFileSync(path.join(harvestShimDir, "claude"), HARVEST_SHIM_SOURCE, { mode: 0o755 });
+const HARVEST_SHIM_PATH = `${harvestShimDir}${path.delimiter}${process.env.PATH ?? ""}`;
+
+function harvestEnv(extra: Record<string, string> = {}): Record<string, string> {
+  return { PATH: HARVEST_SHIM_PATH, BRAIN_HUMAN: "harvesttester", ...extra };
+}
+
+function findHarvestReport(dir: string): string {
+  const dreams = path.join(dir, "dreams");
+  const files = fs.existsSync(dreams) ? fs.readdirSync(dreams).filter((f) => f.startsWith("HARVEST_")) : [];
+  assert.equal(files.length, 1, `expected exactly one harvest report, found: ${files.join(", ")}`);
+  return fs.readFileSync(path.join(dreams, files[0]), "utf8");
+}
+
+check("cli harvest --dry-digest: prints the exact proposer prompt with the digests, no model calls, no report", () => {
+  const root = makeSessionsRoot();
+  const dir = tmpdir("brain-harvest-dry-");
+  try {
+    const r = runCli(["harvest", "--dry-digest", "--dir", dir, "--sessions", root], { env: { PATH: NO_CLAUDE_PATH } });
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(r.stdout.includes("You are the HARVESTER"), "must print the real proposer prompt");
+    assert.ok(r.stdout.includes("project cookbook-app"), r.stdout);
+    assert.ok(r.stdout.includes("Switch the poll interval to 30 seconds"), "the digest must carry the human's words");
+    assert.ok(!fs.existsSync(path.join(dir, "dreams")), "a dry run must not write a report");
+    const filtered = runCli(["harvest", "--dry-digest", "--dir", dir, "--sessions", root, "--project", "other-proj"], { env: { PATH: NO_CLAUDE_PATH } });
+    assert.ok(!filtered.stdout.includes("Switch the poll interval"), "the project filter must keep other projects' content out of the digest");
+    assert.ok(filtered.stdout.includes("staging DB resets nightly"), filtered.stdout);
+    const missing = runCli(["harvest", "--dir", path.join(os.tmpdir(), "definitely-missing-brain")], { env: { PATH: NO_CLAUDE_PATH } });
+    assert.equal(missing.status, 2, "harvest without a brain directory must fail with guidance");
+    assert.equal(runCli(["harvest", "--days", "0", "--dir", dir]).status, 2, "--days must be a positive integer");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+check("cli harvest: missing claude binary fails with the transcript privacy message, never asks for API keys", () => {
+  const root = makeSessionsRoot();
+  const dir = tmpdir("brain-harvest-nobin-");
+  try {
+    const r = runCli(["harvest", "--dir", dir, "--sessions", root], { env: { PATH: NO_CLAUDE_PATH } });
+    assert.equal(r.status, 2, `expected exit 2, got ${r.status}: ${r.stdout}`);
+    assert.ok(r.stderr.includes("Claude Code CLI"), r.stderr);
+    assert.ok(r.stderr.includes("your own logged-in `claude`"), r.stderr);
+    assert.ok(r.stderr.includes("never reads or requires API keys"), r.stderr);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+check("cli harvest report-only: full report with refuter: ran, and NOTHING written to the brain", () => {
+  const root = makeSessionsRoot();
+  const dir = tmpdir("brain-harvest-report-");
+  try {
+    const r = runCli(["harvest", "--dir", dir, "--sessions", root], { env: harvestEnv() });
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(r.stdout.includes("2 session(s) in the last 7 day(s), 2 digested"), r.stdout);
+    assert.ok(r.stdout.includes("refuter: ran"), r.stdout);
+    assert.ok(r.stdout.includes("report-only run"), r.stdout);
+    const report = findHarvestReport(dir);
+    for (const section of ["# Harvest report", "## Sessions", "## Proposals", "## Dedupe", "## Refuter review", "## Applied", "## Undo"]) {
+      assert.ok(report.includes(section), `report must carry section: ${section}`);
+    }
+    assert.ok(report.includes("refuter: ran"), "the mandatory refuter line must be present");
+    assert.ok(!report.includes("refuter: absent"), "a reviewed harvest must not read as unreviewed");
+    assert.ok(report.includes('Proposal 0: decision "Poll interval is 30s"'), report);
+    assert.ok(report.includes("proposal 0: keep"), report);
+    assert.ok(report.includes("transcript content"), "the report must say plainly that content was read");
+    assert.ok(report.includes("report-only run: nothing was applied"), report);
+    assert.ok(report.includes("git revert"), "the report must say how to undo");
+    assert.equal(loadBrain(dir).notes.length, 0, "report-only must write no notes");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+check("cli harvest --apply: notes land with harvest authorship, the session source line, and the 0.85 sourced cap via recall", () => {
+  const root = makeSessionsRoot();
+  const dir = tmpdir("brain-harvest-apply-");
+  try {
+    const r = runCli(["harvest", "--apply", "--dir", dir, "--sessions", root], { env: harvestEnv() });
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(r.stdout.includes("applied: 2 note(s)"), r.stdout);
+    const brain = loadBrain(dir);
+    assert.equal(brain.notes.length, 2);
+    const decision = brain.notes.find((n) => n.type === "decision")!;
+    assert.equal(decision.title, "Poll interval is 30s");
+    assert.deepEqual(decision.author, { human: "harvesttester", agent: "harvest" }, "harvest notes are authored by the brain owner via the harvest agent");
+    assert.ok(decision.body.includes("source: session 2026-08-17, project cookbook-app"), "the body must cite its session");
+    assert.equal(decision.source, undefined, "no special-cased frontmatter source: the body citation is the mechanism");
+    assert.equal(capFor(decision), 0.85, "the session citation earns the sourced-agent cap through ordinary source detection");
+    const recalled = recall(brain, { query: "poll interval" });
+    assert.equal(recalled.length, 1);
+    assert.equal(recalled[0].confidence, 0.75, "fresh uncredited harvest note: 0.85 cap - 0.10");
+    assert.equal(recalled[0].tier, "standing");
+    const convention = brain.notes.find((n) => n.type === "convention")!;
+    assert.equal(convention.title, "Never deploy on Fridays");
+    assert.deepEqual(diagnose(dir), [], "an applied harvest must leave the brain valid");
+    assert.ok(findHarvestReport(dir).includes('wrote decision "Poll interval is 30s"'), "the report must record the writes");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+check("cli harvest: refuter garbage means refuter: absent and ZERO writes, even with --apply", () => {
+  const root = makeSessionsRoot();
+  const dir = tmpdir("brain-harvest-rgarbage-");
+  try {
+    const r = runCli(["harvest", "--apply", "--dir", dir, "--sessions", root], { env: harvestEnv({ FAKE_CLAUDE_MODE: "refuter-garbage" }) });
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(r.stdout.includes("refuter: absent"), r.stdout);
+    assert.ok(r.stdout.includes("applied: nothing"), r.stdout);
+    const report = findHarvestReport(dir);
+    assert.ok(report.includes("refuter: absent"), "the mandatory line must say the reviewer never showed");
+    assert.ok(!report.includes("refuter: ran"), "an unreviewed harvest must never read as reviewed");
+    assert.ok(report.includes("unreviewed harvests are never applied"), report);
+    assert.equal(loadBrain(dir).notes.length, 0, "nothing may be written without adversarial review");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+check("cli harvest: proposer garbage is a graceful empty harvest with an honest report", () => {
+  const root = makeSessionsRoot();
+  const dir = tmpdir("brain-harvest-pgarbage-");
+  try {
+    const r = runCli(["harvest", "--apply", "--dir", dir, "--sessions", root], { env: harvestEnv({ FAKE_CLAUDE_MODE: "proposer-garbage" }) });
+    assert.equal(r.status, 0, r.stderr);
+    const report = findHarvestReport(dir);
+    assert.ok(report.includes("empty harvest"), report);
+    assert.ok(report.includes("refuter: absent"), "with nothing to review the refuter is honestly reported absent");
+    assert.ok(report.includes("not consulted"), "the report must distinguish not-consulted from failed");
+    assert.equal(loadBrain(dir).notes.length, 0, "an empty harvest writes nothing");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+check("cli harvest --apply: refuter rejections and missing verdicts (default reject) gate what is written", () => {
+  const root = makeSessionsRoot();
+  const dir = tmpdir("brain-harvest-rejects-");
+  const src = "\n\nsource: session 2026-08-17, project cookbook-app";
+  const proposals = [
+    { type: "decision", title: "Kept decision", body: "The digests support this one fully, twice over." + src },
+    { type: "gotcha", title: "Rejected gotcha", body: "The refuter will find no evidence for this." + src },
+    { type: "open_thread", title: "Unanswered question", body: "The refuter forgets to give this one a verdict." + src },
+  ];
+  try {
+    const r = runCli(["harvest", "--apply", "--dir", dir, "--sessions", root], {
+      env: harvestEnv({ FAKE_CLAUDE_MODE: "refuter-rejects-some", FAKE_HARVEST_PROPOSALS: JSON.stringify(proposals) }),
+    });
+    assert.equal(r.status, 0, r.stderr);
+    const report = findHarvestReport(dir);
+    assert.ok(report.includes("refuter: ran"), report);
+    assert.ok(report.includes("proposal 0: keep"), report);
+    assert.ok(report.includes("proposal 1: reject"), report);
+    assert.ok(report.includes("rejected by default"), "a missing verdict must be reported as a default reject");
+    assert.ok(report.includes("(defaulted)"), report);
+    const brain = loadBrain(dir);
+    assert.deepEqual(brain.notes.map((n) => n.title), ["Kept decision"], "only the kept proposal may be written");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+check("cli harvest --apply: dedupe skips known facts before review and never writes them twice", () => {
+  const root = makeSessionsRoot();
+  const dir = tmpdir("brain-harvest-dedupe-cli-");
+  const src = "\n\nsource: session 2026-08-17, project cookbook-app";
+  try {
+    createNote(dir, {
+      type: "decision",
+      title: "Poll interval is 30s",
+      body: "Already on record from an earlier session.",
+      author: { human: "harvesttester", agent: null },
+    });
+    const proposals = [
+      { type: "decision", title: "poll interval is 30s", body: "A rediscovery of the same decision, phrased anew." + src },
+      { type: "convention", title: "Never deploy on Fridays", body: "The human said the team never deploys on Fridays after the outage." + src },
+    ];
+    const r = runCli(["harvest", "--apply", "--dir", dir, "--sessions", root], {
+      env: harvestEnv({ FAKE_HARVEST_PROPOSALS: JSON.stringify(proposals) }),
+    });
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(r.stdout.includes("deduped: 1"), r.stdout);
+    const report = findHarvestReport(dir);
+    assert.ok(report.includes('skipped "poll interval is 30s"'), report);
+    assert.ok(report.includes("title matches active note"), report);
+    assert.ok(report.includes('Proposal 0: convention "Never deploy on Fridays"'), "surviving proposals renumber from zero");
+    const brain = loadBrain(dir);
+    assert.equal(brain.notes.length, 2, "one preexisting note plus one new one; no duplicate");
+    assert.equal(brain.notes.filter((n) => n.title.toLowerCase() === "poll interval is 30s").length, 1);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+check("cli harvest --json: machine-readable report with the budget drops recorded; markdown report still written", () => {
+  const root = tmpdir("brain-harvest-budget-root-");
+  const dir = tmpdir("brain-harvest-budget-");
+  try {
+    // 12 sessions of ~1800 digest chars each overflow the 16000-char budget
+    const proj = path.join(root, "-Users-diego-Desktop-busy-proj");
+    for (let i = 0; i < 12; i++) {
+      const entries = Array.from({ length: 12 }, (_, m) => ({
+        type: "user",
+        timestamp: new Date(HNOW - (12 - i) * 3_600_000 + m * 60_000).toISOString(),
+        cwd: "/Users/diego/Desktop/busy-proj",
+        message: { role: "user", content: `session ${i} message ${m} ` + "w".repeat(280) },
+      }));
+      writeJsonl(path.join(proj, `sess-${String(i).padStart(2, "0")}.jsonl`), entries);
+    }
+    const r = runCli(["harvest", "--json", "--dir", dir, "--sessions", root, "--days", "2"], { env: harvestEnv() });
+    assert.equal(r.status, 0, r.stderr);
+    const payload = JSON.parse(r.stdout);
+    assert.equal(payload.mode, "report-only");
+    assert.equal(payload.brain, dir);
+    assert.equal(payload.days, 2);
+    assert.equal(payload.sessions_scanned, 12);
+    assert.ok(payload.sessions_digested < 12, "the budget must force drops");
+    assert.ok(payload.dropped_for_budget.length > 0, "drops must be recorded");
+    assert.equal(payload.sessions_digested + payload.dropped_for_budget.length, 12);
+    const droppedIds = payload.dropped_for_budget.map((s: any) => s.sessionId);
+    assert.ok(droppedIds.includes("sess-00"), "the oldest session must be dropped first");
+    assert.ok(!droppedIds.includes("sess-11"), "the newest session must survive");
+    assert.equal(payload.refuter_ran, true);
+    assert.equal(payload.kept, payload.proposals.length);
+    assert.deepEqual(payload.applied, [], "report-only json must show nothing applied");
+    assert.equal(payload.lock_note, null);
+    assert.ok(fs.existsSync(payload.report_file), "the markdown report file must still be written");
+    const report = fs.readFileSync(payload.report_file, "utf8");
+    assert.ok(report.includes("dropped to fit the 16000 char digest budget"), report);
+    assert.equal(loadBrain(dir).notes.length, 0);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+check("cli harvest: --model reaches claude -p, and the proposer/refuter token ceilings are 8000/4000", () => {
+  const root = makeSessionsRoot();
+  const dir = tmpdir("brain-harvest-model-");
+  try {
+    const log = path.join(dir, "..", `fake-harvest-log-${path.basename(dir)}.jsonl`);
+    const r = runCli(["harvest", "--model", "claude-test-model", "--dir", dir, "--sessions", root], {
+      env: harvestEnv({ FAKE_CLAUDE_LOG: log }),
+    });
+    assert.equal(r.status, 0, r.stderr);
+    const calls = fs.readFileSync(log, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    fs.rmSync(log, { force: true });
+    assert.deepEqual(calls.map((c) => c.role), ["proposer", "refuter"], "exactly two calls: propose, then refute");
+    for (const c of calls) {
+      assert.deepEqual(c.args, ["-p", "--model", "claude-test-model"], "the model id must ride claude -p --model");
+    }
+    assert.equal(calls[0].maxTokens, "8000", "proposer output ceiling");
+    assert.equal(calls[1].maxTokens, "4000", "refuter output ceiling");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+check("cli harvest --apply: a fresh foreign lock means nothing is written and the report says why", () => {
+  const root = makeSessionsRoot();
+  const dir = tmpdir("brain-harvest-lock-");
+  try {
+    fs.writeFileSync(lockPath(dir), JSON.stringify({ pid: 999_999_999, timestamp: new Date().toISOString() }));
+    const r = runCli(["harvest", "--apply", "--dir", dir, "--sessions", root], { env: harvestEnv() });
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(r.stdout.includes("could not take the brain lock"), r.stdout);
+    assert.equal(loadBrain(dir).notes.length, 0, "no notes may be written while another apply holds the lock");
+    assert.ok(findHarvestReport(dir).includes("could not take the brain lock"), "the report must record the lock refusal");
+    assert.ok(fs.existsSync(lockPath(dir)), "the foreign lock must not be deleted by the refused apply");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+fs.rmSync(harvestShimDir, { recursive: true, force: true });
 
 if (failures > 0) {
   console.error(`\n${failures} test(s) FAILED`);
