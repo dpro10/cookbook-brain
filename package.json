@@ -1,0 +1,38 @@
+{
+  "name": "cookbook-brain",
+  "version": "0.1.0",
+  "description": "Agent memory as plain markdown files in a git-friendly directory: typed, attributed, never-overwritten notes with wikilinks, served to any agent over MCP.",
+  "type": "module",
+  "bin": {
+    "cookbook-brain": "bin/cookbook-brain.mjs"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "node bin/cookbook-brain.mjs",
+    "test": "tsx test/test-brain.ts"
+  },
+  "keywords": [
+    "agent",
+    "memory",
+    "mcp",
+    "markdown",
+    "claude-code",
+    "knowledge-base",
+    "cli"
+  ],
+  "author": "Diego Prozzi",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "tsx": "^4.19.0",
+    "zod": "^4.0.0"
+  }
+}
