@@ -28,6 +28,7 @@ npx cookbook-brain tasks         # open and claimed tasks, with age
 npx cookbook-brain doctor        # validate every note, link, chain, and task
 npx cookbook-brain index         # generate INDEX.md, a wikilinked view of the brain
 npx cookbook-brain web           # read-only local viewer at http://127.0.0.1:4321
+npx cookbook-brain install-hook  # every session harvests itself when it closes (report-only)
 ```
 
 The brain directory resolves as `--dir` flag, then the `BRAIN_DIR` environment variable, then `./brain`. Human attribution comes from `BRAIN_HUMAN`, falling back to your OS username. Requires Node 20 or newer.
@@ -143,6 +144,7 @@ npx cookbook-brain harvest                  # report-only: propose notes from th
 npx cookbook-brain harvest --days 30        # scan further back
 npx cookbook-brain harvest --project myapp  # only sessions whose working directory basename matches
 npx cookbook-brain harvest --apply          # write the notes the refuter kept
+npx cookbook-brain harvest --session <id> --since-last  # one session, only messages newer than its watermark
 npx cookbook-brain harvest --dry-digest     # print exactly what would be sent to the model, then exit
 npx cookbook-brain harvest --json           # machine-readable report on stdout (report file still written)
 npx cookbook-brain harvest --sessions <path> --model <id>   # override the transcripts root and the model
@@ -154,6 +156,31 @@ Straight answers to the questions you should be asking:
 - **Where it sends it.** Compact per-session digests go to your own logged-in `claude` CLI, the same tool that produced the sessions in the first place. No API keys, no other network calls, nothing leaves your machine by any path your `claude` login does not already use. `--dry-digest` prints the exact outbound prompt.
 - **What it writes.** Nothing, by default. A report at `brain/dreams/HARVEST_<date>.md` lists every proposal, every dedupe skip (facts the brain already holds), and every refuter verdict, including the mandatory `refuter: ran` or `refuter: absent` line; an unreviewed harvest applies nothing, even with `--apply`. Only `--apply` writes notes, and an applied harvest only adds new files, so undoing it is `git revert` or deleting the listed files.
 - **The distrust property.** Harvested notes are authored `{ human: you, agent: "harvest" }`, and each body ends with a `source:` line citing its session with the actual message-date range of the digested slice (for example `source: session 2026-08-15, project cookbook-app`, or `source: session 2026-08-12 to 2026-08-18, project phonestack` for a long-lived session). That citation earns the sourced-agent confidence cap (0.85) through the ordinary source detection, nothing special-cased: the brain trusts its own bootstrap more than a bare claim, but less than you, until real work credits the notes upward.
+
+Two flags make harvest surgical instead of sweeping. `--session <id>` harvests exactly one transcript (the day window still applies, defaulting to a generous 2 days in this mode). `--since-last` makes harvest incremental: it reads per-session watermarks from `brain/dreams/harvested.json` (a map of session id to the timestamp of the last message a harvest digested) and only digests messages newer than each watermark, so a session file you keep alive for months never re-digests old content. Every successful harvest, report-only included, advances the watermarks; a failed or unparseable model call advances nothing, so content is never silently lost. The file lives under `dreams/`, the note scanner never reads it, and deleting it just means the next harvest starts from the plain day window.
+
+## Autoharvest: sessions that distill themselves
+
+One command makes every Claude Code session harvest itself when it closes:
+
+```
+npx cookbook-brain install-hook
+```
+
+That registers a SessionEnd hook in `~/.claude/settings.json`, surgically: the file is parsed, exactly one entry is merged in, every other key and hook is preserved, and the command refuses to write at all if the file does not parse. From then on, whenever a session ends, the hook reads the SessionEnd payload, spawns a DETACHED background run of
+
+```
+cookbook-brain harvest --session <that session> --since-last --json
+```
+
+against the session's working directory, and exits immediately, so closing a session is never delayed. The `--since-last` watermark means a long-lived session is only ever digested incrementally: each close distills just what happened since the last harvest.
+
+The straight answers, again:
+
+- **Always report-only.** The hook cannot apply, by design and hard-coded: unattended writes to your memory need your eyes first. Kept proposals accumulate in the reports, and `cookbook-brain log` ends with a line like `2 harvest report(s) with unapplied keeps: review with cookbook-brain harvest --apply` whenever recent reports hold kept-but-unapplied notes. Review them over coffee and apply when you agree; dedupe keeps already-known facts from ever landing twice.
+- **Where the output lives.** Each run appends its JSON report to `~/.cookbook-brain-autoharvest.log`, and the markdown report lands in `brain/dreams/HARVEST_<date>.md` like any harvest (the `web` viewer shows them too). The brain directory resolves from the session's own working directory (`./brain`, or `BRAIN_DIR`), so a session in a project without a brain just logs a polite failure and changes nothing.
+- **The honest cost note.** A session close triggers up to two model calls (proposer and refuter) on your own `claude` CLI login. They run detached, so closing is instant, but they are real calls on your account. The mitigations are structural: a session with nothing new past its watermark exits before any model call, and the tool's own `claude -p` runs (harvest and dream calls) are detected by their prompt marker and skipped outright, so autoharvest never recurses on itself.
+- **Undo is one command.** `npx cookbook-brain uninstall-hook` removes only the cookbook-brain entry and leaves every other setting and hook untouched. Sessions already running notice on their next restart, in both directions.
 
 ## What it is not
 

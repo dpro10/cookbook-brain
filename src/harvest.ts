@@ -104,6 +104,56 @@ const AGENT_CONCLUSION_MIN_CHARS = 100;
 
 const SOURCE_LINE_RE = /^\s*source:\s*\S+/im;
 
+// ---- harvest watermarks (--since-last) ----
+
+/**
+ * One session's harvest watermark: the timestamp of the last message a
+ * successful harvest digested from it, and when that harvest ran. Stored in
+ * brain/dreams/harvested.json (the dreams/ subdirectory the note scanner
+ * never reads), as a map of sessionId -> watermark. --since-last digests
+ * only messages strictly NEWER than lastMessageTs, so long-lived sessions
+ * are harvested incrementally and never re-digest old content. Deleting the
+ * file is safe: the next harvest simply starts from the plain day window.
+ */
+export interface SessionWatermark {
+  /** ISO timestamp of the last message a successful harvest digested from this session */
+  lastMessageTs: string;
+  /** ISO timestamp of the harvest run that stamped this watermark */
+  harvestedAt: string;
+}
+
+export type WatermarkMap = Record<string, SessionWatermark>;
+
+export const WATERMARK_FILENAME = "harvested.json";
+
+export function watermarksPath(dir: string): string {
+  return path.join(dir, "dreams", WATERMARK_FILENAME);
+}
+
+/** Read the watermark map. A missing, unreadable, or malformed file reads as empty: watermarks are an optimization, never a gate. */
+export function readWatermarks(dir: string): WatermarkMap {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fs.readFileSync(watermarksPath(dir), "utf8"));
+  } catch {
+    return {};
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return {};
+  const out: WatermarkMap = {};
+  for (const [sessionId, value] of Object.entries(parsed)) {
+    const w = value as SessionWatermark;
+    if (typeof w?.lastMessageTs === "string" && typeof w?.harvestedAt === "string") {
+      out[sessionId] = { lastMessageTs: w.lastMessageTs, harvestedAt: w.harvestedAt };
+    }
+  }
+  return out;
+}
+
+export function writeWatermarks(dir: string, marks: WatermarkMap): void {
+  fs.mkdirSync(path.join(dir, "dreams"), { recursive: true });
+  fs.writeFileSync(watermarksPath(dir), JSON.stringify(marks, null, 2) + "\n");
+}
+
 // ---- scanning transcripts ----
 
 interface SessionItem {
@@ -134,6 +184,15 @@ export interface ScanOptions {
   days: number;
   /** case-insensitive exact match on the session's cwd basename */
   project?: string;
+  /** exact session id: scan only the transcript file named <sessionId>.jsonl */
+  sessionId?: string;
+  /**
+   * per-session watermarks (--since-last): messages at or before a session's
+   * lastMessageTs are excluded, so a long-lived session contributes only what
+   * arrived since its last harvest. Sessions with nothing newer count as
+   * upToDate, never as noInWindow.
+   */
+  watermarks?: WatermarkMap;
 }
 
 export interface ScanResult {
@@ -142,6 +201,8 @@ export interface ScanResult {
   internalRuns: number;
   /** sessions whose file passed the mtime pre-filter but whose substantive messages all fall outside the window */
   noInWindow: number;
+  /** sessions whose watermark already covers every substantive in-window message (--since-last found nothing new) */
+  upToDate: number;
 }
 
 /**
@@ -162,6 +223,34 @@ const INTERNAL_RUN_PREFIXES = [
 export function isInternalRunPrompt(text: string): boolean {
   const t = text.trimStart();
   return INTERNAL_RUN_PREFIXES.some((p) => t.startsWith(p));
+}
+
+/**
+ * The first non-meta user message text of a transcript file, or null when
+ * there is none (or the file is unreadable). hook-run's recursion guard
+ * feeds this to isInternalRunPrompt so a SessionEnd fired by one of this
+ * tool's own `claude -p` runs never spawns another harvest.
+ */
+export function transcriptFirstUserText(file: string): string | null {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(file, "utf8");
+  } catch {
+    return null;
+  }
+  for (const line of raw.split("\n")) {
+    if (!line.trim()) continue;
+    let o: Record<string, unknown>;
+    try {
+      o = JSON.parse(line);
+    } catch {
+      continue; // partial write
+    }
+    if (o.type !== "user" || o.isMeta) continue;
+    const text = textOf((o.message as { content?: unknown } | undefined)?.content).trim();
+    if (text !== "") return text;
+  }
+  return null;
 }
 
 /** The encoded project folder name embeds the full path; reduce to a basename (same trick as cookbook-meter). */
@@ -219,11 +308,12 @@ export function scanSessions(root: string, opts: ScanOptions): ScanResult {
   const out: ScannedSession[] = [];
   let internalRuns = 0;
   let noInWindow = 0;
+  let upToDate = 0;
   let projectDirs: fs.Dirent[];
   try {
     projectDirs = fs.readdirSync(root, { withFileTypes: true });
   } catch {
-    return { sessions: [], internalRuns, noInWindow };
+    return { sessions: [], internalRuns, noInWindow, upToDate };
   }
   for (const pd of projectDirs) {
     if (!pd.isDirectory()) continue;
@@ -236,6 +326,10 @@ export function scanSessions(root: string, opts: ScanOptions): ScanResult {
     }
     for (const e of entries) {
       if (!e.isFile() || !e.name.endsWith(".jsonl")) continue; // directories (subagents/ etc.) deliberately skipped
+      const sessionId = path.basename(e.name, ".jsonl");
+      if (opts.sessionId && sessionId !== opts.sessionId) continue; // --session: exactly one transcript
+      // --since-last: this session's watermark, when one exists
+      const watermarkTs = opts.watermarks?.[sessionId]?.lastMessageTs;
       const file = path.join(dir, e.name);
       try {
         // pre-filter ONLY: a transcript's mtime is >= its last line's timestamp, so older files cannot contain in-window messages
@@ -256,6 +350,7 @@ export function scanSessions(root: string, opts: ScanOptions): ScanResult {
       let firstUserSeen = false;
       let internal = false;
       let droppedOutOfWindow = 0;
+      let droppedByWatermark = 0;
       const items: SessionItem[] = [];
       for (const line of raw.split("\n")) {
         if (!line.trim()) continue;
@@ -289,6 +384,11 @@ export function scanSessions(root: string, opts: ScanOptions): ScanResult {
           droppedOutOfWindow++;
           continue;
         }
+        // --since-last: only messages strictly NEWER than the watermark are new content
+        if (watermarkTs && lastTs <= watermarkTs) {
+          droppedByWatermark++;
+          continue;
+        }
         if (!start || lastTs < start) start = lastTs;
         if (!end || lastTs > end) end = lastTs;
         items.push({ role: type === "user" ? "human" : "agent", text });
@@ -300,11 +400,12 @@ export function scanSessions(root: string, opts: ScanOptions): ScanResult {
         continue;
       }
       if (items.length === 0) {
-        if (droppedOutOfWindow > 0) noInWindow++;
+        if (droppedByWatermark > 0) upToDate++;
+        else if (droppedOutOfWindow > 0) noInWindow++;
         continue;
       }
       out.push({
-        sessionId: path.basename(e.name, ".jsonl"),
+        sessionId,
         project,
         startDate: start!.slice(0, 10),
         date: end!.slice(0, 10),
@@ -314,7 +415,7 @@ export function scanSessions(root: string, opts: ScanOptions): ScanResult {
     }
   }
   out.sort((a, b) => (a.end < b.end ? -1 : a.end > b.end ? 1 : 0));
-  return { sessions: out, internalRuns, noInWindow };
+  return { sessions: out, internalRuns, noInWindow, upToDate };
 }
 
 // ---- digests ----
@@ -634,6 +735,10 @@ export interface HarvestOptions {
   sessionsRoot: string;
   days: number;
   project?: string;
+  /** --session: harvest exactly one transcript by session id */
+  sessionId?: string;
+  /** --since-last: digest only messages newer than each session's watermark in dreams/harvested.json */
+  sinceLast?: boolean;
   apply: boolean;
   model?: string;
   now?: number;
@@ -648,6 +753,10 @@ export interface HarvestOutcome {
   internalRuns: number;
   /** sessions whose substantive messages all fall outside the window */
   noInWindow: number;
+  /** --since-last: sessions whose watermark already covers everything in the window */
+  upToDate: number;
+  /** sessions whose watermark in dreams/harvested.json was advanced by this harvest */
+  watermarksUpdated: number;
   sessionsDigested: number;
   droppedForBudget: SessionDigestInfo[];
   /** proposals that survived validation AND dedupe; refuter verdicts index into this list */
@@ -664,7 +773,13 @@ export interface HarvestOutcome {
 
 export function harvest(opts: HarvestOptions): HarvestOutcome {
   const now = opts.now ?? Date.now();
-  const scan = scanSessions(opts.sessionsRoot, { now, days: opts.days, project: opts.project });
+  const scan = scanSessions(opts.sessionsRoot, {
+    now,
+    days: opts.days,
+    project: opts.project,
+    sessionId: opts.sessionId,
+    watermarks: opts.sinceLast ? readWatermarks(opts.dir) : undefined,
+  });
   const sessions = scan.sessions;
   const digest = buildHarvestDigest(sessions);
   const brain = loadBrain(opts.dir);
@@ -692,6 +807,30 @@ export function harvest(opts: HarvestOptions): HarvestOutcome {
         ({ proposals: validated, invalid } = validateHarvestProposals(parsed));
       }
     }
+  }
+
+  // watermarks: EVERY successful harvest (report-only included) advances the
+  // per-session watermarks in dreams/harvested.json, so --since-last never
+  // re-digests messages that already reached a proposer. "Successful" means
+  // the proposer returned parseable output for a non-empty digest; a failed
+  // or unparseable proposer stamps nothing, so the next run retries the same
+  // messages instead of silently losing them. Sessions dropped for the digest
+  // budget are not stamped either: their content never left for the model.
+  let watermarksUpdated = 0;
+  if (digest.included.length > 0 && proposerNote === null) {
+    const marks = readWatermarks(opts.dir);
+    const nowIso = new Date(now).toISOString();
+    const bySessionId = new Map(sessions.map((s) => [s.sessionId, s]));
+    for (const info of digest.included) {
+      const end = bySessionId.get(info.sessionId)!.end;
+      const prev = marks[info.sessionId];
+      marks[info.sessionId] = {
+        lastMessageTs: prev && prev.lastMessageTs > end ? prev.lastMessageTs : end,
+        harvestedAt: nowIso,
+      };
+      watermarksUpdated++;
+    }
+    writeWatermarks(opts.dir, marks);
   }
 
   // dedupe before review: the refuter's attention is spent on new facts only
@@ -779,12 +918,16 @@ export function harvest(opts: HarvestOptions): HarvestOutcome {
     sessionsRoot: opts.sessionsRoot,
     days: opts.days,
     project: opts.project,
+    sessionId: opts.sessionId,
+    sinceLast: opts.sinceLast === true,
     now,
     apply: opts.apply,
     model: opts.model,
     sessionsScanned: sessions.length,
     internalRuns: scan.internalRuns,
     noInWindow: scan.noInWindow,
+    upToDate: scan.upToDate,
+    watermarksUpdated,
     digest,
     proposals,
     invalid,
@@ -805,6 +948,8 @@ export function harvest(opts: HarvestOptions): HarvestOutcome {
     sessionsScanned: sessions.length,
     internalRuns: scan.internalRuns,
     noInWindow: scan.noInWindow,
+    upToDate: scan.upToDate,
+    watermarksUpdated,
     sessionsDigested: digest.included.length,
     droppedForBudget: digest.dropped,
     proposals,
@@ -826,12 +971,16 @@ interface ReportInput {
   sessionsRoot: string;
   days: number;
   project?: string;
+  sessionId?: string;
+  sinceLast: boolean;
   now: number;
   apply: boolean;
   model?: string;
   sessionsScanned: number;
   internalRuns: number;
   noInWindow: number;
+  upToDate: number;
+  watermarksUpdated: number;
   digest: HarvestDigest;
   proposals: HarvestProposal[];
   invalid: InvalidHarvestProposal[];
@@ -858,6 +1007,8 @@ function renderReport(r: ReportInput): string {
     `- sessions root: ${r.sessionsRoot}`,
     `- window: last ${r.days} day(s)`,
     `- project filter: ${r.project ?? "(none)"}`,
+    `- session filter: ${r.sessionId ?? "(none)"}`,
+    `- incremental: ${r.sinceLast ? "--since-last, only messages newer than each session's watermark (dreams/harvested.json)" : "off (full window)"}`,
     `- mode: ${r.apply ? "apply" : "report-only"}`,
     `- model: ${r.model ?? "default (your claude CLI setting)"}`,
     "",
@@ -869,6 +1020,8 @@ function renderReport(r: ReportInput): string {
     `- what was read: transcript content (the human's messages and the assistant's conclusions), sent only to your own claude CLI`,
   ];
   if (r.noInWindow > 0) lines.push(`- no in-window activity: ${r.noInWindow} session(s) (touched files whose messages all predate the window)`);
+  if (r.upToDate > 0) lines.push(`- up to date: ${r.upToDate} session(s) with nothing newer than their harvest watermark`);
+  if (r.watermarksUpdated > 0) lines.push(`- watermarks: advanced for ${r.watermarksUpdated} session(s) in dreams/harvested.json`);
   if (r.digest.dropped.length > 0) {
     lines.push(`- dropped to fit the ${HARVEST_DIGEST_CHAR_BUDGET} char digest budget (oldest first): ${r.digest.dropped.length}`);
     for (const s of r.digest.dropped) lines.push(`  - ${sessionLine(s)}`);
@@ -937,6 +1090,36 @@ function renderReport(r: ReportInput): string {
     "",
   );
   return lines.join("\n");
+}
+
+/**
+ * Count recent harvest reports carrying kept-but-unapplied proposals, so
+ * `cookbook-brain log` can surface work waiting for a human --apply. Cheap
+ * and deterministic on purpose: a report counts when it holds at least one
+ * "keep" verdict line AND its Applied section says the run was report-only.
+ * "Recent" means modified in the last 7 days, so old reviewed reports stop
+ * nagging. Unreadable files are skipped, never fatal.
+ */
+export function pendingHarvestKeeps(dir: string, now: number = Date.now()): number {
+  const dreamsDir = path.join(dir, "dreams");
+  let files: string[];
+  try {
+    files = fs.readdirSync(dreamsDir).filter((f) => f.startsWith("HARVEST_") && f.endsWith(".md"));
+  } catch {
+    return 0;
+  }
+  let count = 0;
+  for (const f of files) {
+    const file = path.join(dreamsDir, f);
+    try {
+      if (now - fs.statSync(file).mtimeMs > 7 * DAY_MS) continue;
+      const text = fs.readFileSync(file, "utf8");
+      if (/^- proposal \d+: keep\b/m.test(text) && text.includes("report-only run: nothing was applied")) count++;
+    } catch {
+      /* unreadable report: skip */
+    }
+  }
+  return count;
 }
 
 /** Reports live in brain/dreams/, the same subdirectory dream uses, which the note scanner never reads. */

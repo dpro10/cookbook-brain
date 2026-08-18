@@ -66,12 +66,17 @@ import {
   harvestRefuterPrompt,
   isInternalRunPrompt,
   normalizeSourceLine,
+  pendingHarvestKeeps,
   planHarvestReview,
+  readWatermarks,
   scanSessions,
   sessionDateRange,
+  transcriptFirstUserText,
   trigramOverlap,
   validateHarvestProposals,
+  watermarksPath,
   wordTrigrams,
+  writeWatermarks,
   type HarvestProposal,
   type ScannedSession,
 } from "../src/harvest.ts";
@@ -129,12 +134,13 @@ function tmpdir(prefix: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
 
-function runCli(args: string[], opts: { cwd?: string; env?: Record<string, string> } = {}) {
+function runCli(args: string[], opts: { cwd?: string; env?: Record<string, string>; input?: string } = {}) {
   const r = spawnSync(process.execPath, [BIN, ...args], {
     cwd: opts.cwd ?? tmpdir("brain-cli-"),
     env: { ...process.env, ...opts.env },
     encoding: "utf8",
-    timeout: 30_000,
+    timeout: 60_000,
+    input: opts.input,
   });
   return { status: r.status ?? -1, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
 }
@@ -3151,6 +3157,375 @@ async function webViewerTest(): Promise<void> {
 }
 
 await webViewerTest();
+
+// ---- v0.7: autoharvest (watermarks, --session, the SessionEnd hook, pending keeps) ----
+
+/** A fresh claude shim for the v0.7 runs (the earlier harvest shim dir was removed after its section). */
+const v7ShimDir = tmpdir("brain-v7-shim-");
+fs.writeFileSync(path.join(v7ShimDir, "claude"), HARVEST_SHIM_SOURCE, { mode: 0o755 });
+const V7_SHIM_PATH = `${v7ShimDir}${path.delimiter}${process.env.PATH ?? ""}`;
+
+function v7Env(extra: Record<string, string> = {}): Record<string, string> {
+  return { PATH: V7_SHIM_PATH, BRAIN_HUMAN: "hooktester", ...extra };
+}
+
+/** The long-lived session fixture again: months of history, three in-window messages. */
+function makeLongLivedV7Root(): { root: string; transcript: string } {
+  const root = tmpdir("brain-v7-longlived-");
+  const proj = path.join(root, "-Users-diego-Desktop-phonestack");
+  const cwd = "/Users/diego/Desktop/phonestack";
+  const transcript = path.join(proj, "sess-long-9999.jsonl");
+  writeJsonl(transcript, [
+    { type: "user", timestamp: hIso(60, 0), cwd, message: { role: "user", content: "ANCIENT_DECISION_MUST_NOT_APPEAR: back in June we picked SwiftUI over UIKit." } },
+    { type: "assistant", timestamp: hIso(60, 1), cwd, message: { role: "assistant", content: [{ type: "text", text: "ANCIENT_CONCLUSION_MUST_NOT_APPEAR even though this conclusion easily clears the one hundred character floor for agent conclusions." }] } },
+    { type: "user", timestamp: hIso(5, 0), cwd, message: { role: "user", content: "This week we locked the sonar sampling rate at 48 kilohertz for the wearable." } },
+    { type: "user", timestamp: hIso(2, 0), cwd, message: { role: "user", content: "And the revenue track ships before the sonar demo, that ordering is settled." } },
+    { type: "assistant", timestamp: hIso(2, 1), cwd, message: { role: "assistant", content: [{ type: "text", text: "Settled then: revenue track first, sonar demo second, and the sampling rate stays at 48 kilohertz for the wearable hardware." }] } },
+  ]);
+  return { root, transcript };
+}
+
+check("watermarks: round-trip in dreams/harvested.json; missing, malformed, and partial files read safely", () => {
+  const dir = tmpdir("brain-v7-wm-");
+  try {
+    assert.deepEqual(readWatermarks(dir), {}, "no file means no watermarks");
+    assert.equal(watermarksPath(dir), path.join(dir, "dreams", "harvested.json"), "the file lives under dreams/, which the note scanner never reads");
+    const marks = { "sess-long-9999": { lastMessageTs: hIso(2, 1), harvestedAt: hIso(0, 0) } };
+    writeWatermarks(dir, marks);
+    assert.deepEqual(readWatermarks(dir), marks, "round-trip");
+    fs.writeFileSync(watermarksPath(dir), "not json at all");
+    assert.deepEqual(readWatermarks(dir), {}, "a malformed file reads as empty, never throws");
+    fs.writeFileSync(watermarksPath(dir), JSON.stringify({ ok: { lastMessageTs: "2026-08-16T00:00:00.000Z", harvestedAt: "2026-08-18T00:00:00.000Z" }, bad: { nope: 1 }, worse: "x" }));
+    assert.deepEqual(Object.keys(readWatermarks(dir)), ["ok"], "malformed entries are dropped individually");
+    // the watermark file is not a note and never disturbs the brain
+    createNote(dir, { type: "note", title: "Real note", body: "x", author: { human: "d", agent: null } });
+    assert.equal(loadBrain(dir).notes.length, 1);
+    assert.deepEqual(diagnose(dir), []);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+check("harvest scan: a watermark digests only NEWER messages; a fully covered session counts up to date", () => {
+  const { root } = makeLongLivedV7Root();
+  try {
+    const wmAt = (ts: string) => ({ "sess-long-9999": { lastMessageTs: ts, harvestedAt: hIso(0, 0) } });
+    const full = scanSessions(root, { now: HNOW, days: 7 });
+    assert.equal(full.sessions[0].items.length, 3);
+    assert.equal(full.upToDate, 0);
+    const partial = scanSessions(root, { now: HNOW, days: 7, watermarks: wmAt(hIso(5, 0)) });
+    assert.equal(partial.sessions.length, 1);
+    assert.equal(partial.sessions[0].items.length, 2, "the message AT the watermark was already harvested; only strictly newer ones ride");
+    assert.equal(partial.sessions[0].startDate, hIso(2, 0).slice(0, 10), "attribution starts at the first NEW message");
+    assert.ok(!buildHarvestDigest(partial.sessions).text.includes("sonar sampling rate"), "watermarked content must never reach a digest again");
+    const covered = scanSessions(root, { now: HNOW, days: 7, watermarks: wmAt(hIso(2, 1)) });
+    assert.deepEqual(covered.sessions, [], "nothing newer than the watermark leaves nothing to digest");
+    assert.equal(covered.upToDate, 1, "the covered session counts as up to date");
+    assert.equal(covered.noInWindow, 0, "up to date is not the same as out of window");
+    const foreign = scanSessions(root, { now: HNOW, days: 7, watermarks: { "sess-other": { lastMessageTs: hIso(0, 0), harvestedAt: hIso(0, 0) } } });
+    assert.equal(foreign.sessions[0].items.length, 3, "another session's watermark filters nothing here");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+check("harvest scan: sessionId selects exactly one transcript", () => {
+  const root = makeSessionsRoot();
+  try {
+    const one = scanSessions(root, { now: HNOW, days: 7, sessionId: "sess-bbbb-2222" });
+    assert.deepEqual(one.sessions.map((s) => s.sessionId), ["sess-bbbb-2222"]);
+    assert.equal(one.internalRuns, 0, "other transcripts are never even opened");
+    assert.deepEqual(scanSessions(root, { now: HNOW, days: 7, sessionId: "sess-no-such" }).sessions, []);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+check("cli harvest --session: harvests exactly one transcript, and the window defaults to 2 days", () => {
+  const root = makeSessionsRoot();
+  const dir = tmpdir("brain-v7-session-");
+  try {
+    const r = runCli(["harvest", "--json", "--dir", dir, "--sessions", root, "--session", "sess-aaaa-1111"], { env: v7Env() });
+    assert.equal(r.status, 0, r.stderr);
+    const payload = JSON.parse(r.stdout);
+    assert.equal(payload.session, "sess-aaaa-1111");
+    assert.equal(payload.days, 2, "--session narrows the default window to 2 days");
+    assert.equal(payload.sessions_scanned, 1, "exactly one transcript rides");
+    assert.equal(payload.sessions_digested, 1);
+    assert.ok(fs.readFileSync(payload.report_file, "utf8").includes("- session filter: sess-aaaa-1111"), "the report names the session filter");
+    // the message window still applies in session mode: a 30-day-old session digests nothing at the default
+    const old = JSON.parse(runCli(["harvest", "--json", "--dir", dir, "--sessions", root, "--session", "sess-old-3333"], { env: v7Env() }).stdout);
+    assert.equal(old.sessions_scanned, 0, "the 2-day default window keeps a 30-day-old session out");
+    // and an explicit --days always wins over the session-mode default
+    const wide = JSON.parse(runCli(["harvest", "--json", "--dir", dir, "--sessions", root, "--session", "sess-old-3333", "--days", "40"], { env: v7Env() }).stdout);
+    assert.equal(wide.days, 40);
+    assert.equal(wide.sessions_scanned, 1);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+check("cli harvest --since-last: the first run stamps the watermark, repeat runs digest only what is new", () => {
+  const { root, transcript } = makeLongLivedV7Root();
+  const dir = tmpdir("brain-v7-since-");
+  try {
+    // run 1: digests the three in-window messages and stamps the watermark
+    const p1 = JSON.parse(runCli(["harvest", "--json", "--since-last", "--dir", dir, "--sessions", root], { env: v7Env() }).stdout);
+    assert.equal(p1.since_last, true);
+    assert.equal(p1.sessions_digested, 1);
+    assert.equal(p1.watermarks_updated, 1, "a successful report-only harvest still advances the watermark");
+    const marks1 = readWatermarks(dir);
+    assert.equal(marks1["sess-long-9999"].lastMessageTs, hIso(2, 1), "the watermark is the last digested message's own timestamp");
+    // run 2, nothing new: the session reads up to date and the model is never called
+    const p2 = JSON.parse(runCli(["harvest", "--json", "--since-last", "--dir", dir, "--sessions", root], { env: v7Env() }).stdout);
+    assert.equal(p2.sessions_scanned, 0);
+    assert.equal(p2.up_to_date, 1, "a covered session counts as up to date");
+    assert.equal(p2.watermarks_updated, 0, "nothing digested, nothing stamped");
+    assert.deepEqual(readWatermarks(dir), marks1, "the watermark file is untouched");
+    // new activity arrives in the same long-lived session
+    fs.appendFileSync(
+      transcript,
+      JSON.stringify({ type: "user", timestamp: hIso(0, -10), cwd: "/Users/diego/Desktop/phonestack", message: { role: "user", content: "Fresh decision: the wearable battery test runs before every demo from now on." } }) + "\n",
+    );
+    // the outbound digest carries ONLY the new message
+    const dry = runCli(["harvest", "--dry-digest", "--since-last", "--dir", dir, "--sessions", root], { env: { PATH: NO_CLAUDE_PATH } });
+    assert.ok(dry.stdout.includes("Fresh decision"), dry.stdout);
+    assert.ok(!dry.stdout.includes("sonar sampling rate"), "already-harvested content must never re-digest");
+    assert.ok(!dry.stdout.includes("ANCIENT_DECISION"), "out-of-window content stays out too");
+    // run 3 digests only the new slice and advances the watermark
+    const p3 = JSON.parse(runCli(["harvest", "--json", "--since-last", "--dir", dir, "--sessions", root], { env: v7Env() }).stdout);
+    assert.equal(p3.sessions_digested, 1);
+    const marks3 = readWatermarks(dir);
+    assert.equal(marks3["sess-long-9999"].lastMessageTs, hIso(0, -10), "the watermark advances to the newest digested message");
+    assert.ok(marks3["sess-long-9999"].lastMessageTs > marks1["sess-long-9999"].lastMessageTs);
+    assert.equal(loadBrain(dir).notes.length, 0, "every run here was report-only");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+check("cli harvest: a failed proposer stamps NO watermark, so the next run retries the same messages", () => {
+  const { root } = makeLongLivedV7Root();
+  const dir = tmpdir("brain-v7-wmfail-");
+  try {
+    const p = JSON.parse(runCli(["harvest", "--json", "--since-last", "--dir", dir, "--sessions", root], { env: v7Env({ FAKE_CLAUDE_MODE: "proposer-garbage" }) }).stdout);
+    assert.equal(p.watermarks_updated, 0, "an unparseable proposer is not a successful harvest");
+    assert.deepEqual(readWatermarks(dir), {}, "nothing was stamped, so nothing is ever silently lost");
+    // the retry digests the same three messages
+    const retry = JSON.parse(runCli(["harvest", "--json", "--since-last", "--dir", dir, "--sessions", root], { env: v7Env() }).stdout);
+    assert.equal(retry.sessions_digested, 1);
+    assert.equal(retry.watermarks_updated, 1);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+check("cli hook-run --no-detach: parses the SessionEnd JSON and runs a report-only incremental harvest inline", () => {
+  const { root, transcript } = makeLongLivedV7Root();
+  const dir = tmpdir("brain-v7-hookrun-");
+  const sessionCwd = tmpdir("brain-v7-hookcwd-");
+  try {
+    const payload = { session_id: "sess-long-9999", transcript_path: transcript, cwd: sessionCwd, hook_event_name: "SessionEnd", reason: "exit" };
+    const r = runCli(["hook-run", "--no-detach", "--dir", dir, "--sessions", root], { env: v7Env(), input: JSON.stringify(payload) });
+    assert.equal(r.status, 0, r.stderr);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.mode, "report-only", "hook mode is ALWAYS report-only; --apply does not exist here");
+    assert.equal(out.session, "sess-long-9999", "the session id comes from the stdin JSON");
+    assert.equal(out.since_last, true, "hook harvests are incremental");
+    assert.equal(out.days, 2, "session-mode default window");
+    assert.equal(out.sessions_digested, 1);
+    assert.ok(fs.existsSync(out.report_file), "the markdown report lands like any harvest");
+    assert.equal(readWatermarks(dir)["sess-long-9999"].lastMessageTs, hIso(2, 1), "the hook run stamps the watermark");
+    assert.equal(loadBrain(dir).notes.length, 0, "a hook run must never write notes");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(sessionCwd, { recursive: true, force: true });
+  }
+});
+
+check("cli hook-run: the recursion guard skips the tool's own sessions; broken stdin exits 0 quietly", () => {
+  const root = tmpdir("brain-v7-guard-root-");
+  const dir = tmpdir("brain-v7-guard-");
+  try {
+    const transcript = path.join(root, "-Users-diego-Desktop-cookbook-brain", "sess-guard-0001.jsonl");
+    writeJsonl(transcript, [
+      { type: "user", timestamp: hIso(0, -5), cwd: "/x", isMeta: true, message: { role: "user", content: "meta noise first" } },
+      { type: "user", timestamp: hIso(0, -4), cwd: "/x", message: { role: "user", content: `${INTERNAL_RUN_MARKER}\nYou are the HARVESTER in a memory bootstrap pass.` } },
+    ]);
+    assert.ok(isInternalRunPrompt(transcriptFirstUserText(transcript)!), "the guard reuses isInternalRunPrompt on the first non-meta user message");
+    assert.equal(transcriptFirstUserText(path.join(root, "missing.jsonl")), null, "an unreadable transcript reads as no message");
+    const payload = { session_id: "sess-guard-0001", transcript_path: transcript, cwd: dir };
+    const r = runCli(["hook-run", "--no-detach", "--dir", dir, "--sessions", root], { env: v7Env(), input: JSON.stringify(payload) });
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(r.stdout.trim(), "", "an internal session spawns no harvest at all");
+    assert.ok(!fs.existsSync(path.join(dir, "dreams")), "no report may be written");
+    // garbage stdin and a missing session_id both exit 0 without doing anything: session close must never break
+    assert.equal(runCli(["hook-run", "--no-detach", "--dir", dir, "--sessions", root], { env: v7Env(), input: "not json" }).status, 0);
+    assert.equal(runCli(["hook-run", "--no-detach", "--dir", dir, "--sessions", root], { env: v7Env(), input: "{}" }).status, 0);
+    assert.ok(!fs.existsSync(path.join(dir, "dreams")));
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await checkAsync("cli hook-run detached: exits 0 immediately and the harvest lands in the log", async () => {
+  const { root, transcript } = makeLongLivedV7Root();
+  const dir = tmpdir("brain-v7-detach-");
+  const sessionCwd = tmpdir("brain-v7-detach-cwd-");
+  const log = path.join(tmpdir("brain-v7-detach-log-"), "autoharvest.log");
+  try {
+    const payload = { session_id: "sess-long-9999", transcript_path: transcript, cwd: sessionCwd };
+    const r = runCli(["hook-run", "--dir", dir, "--sessions", root], {
+      env: v7Env({ COOKBOOK_BRAIN_AUTOHARVEST_LOG: log }),
+      input: JSON.stringify(payload),
+    });
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(r.stdout.trim(), "", "detached mode prints nothing: the output goes to the log");
+    assert.ok(fs.existsSync(log), "the log header is written before hook-run exits");
+    assert.ok(fs.readFileSync(log, "utf8").includes("[cookbook-brain autoharvest]"), "the log opens with a stamped header line");
+    // the detached child finishes on its own schedule; poll for its JSON report
+    const deadline = Date.now() + 30_000;
+    while (Date.now() < deadline && !fs.readFileSync(log, "utf8").includes('"report_file"')) {
+      await new Promise((res) => setTimeout(res, 250));
+    }
+    const logText = fs.readFileSync(log, "utf8");
+    assert.ok(logText.includes('"mode": "report-only"'), `the detached harvest must be report-only; log was:\n${logText.slice(0, 500)}`);
+    assert.ok(logText.includes('"session": "sess-long-9999"'), logText.slice(0, 500));
+    assert.ok(logText.includes('"since_last": true'), "the detached harvest is incremental");
+    assert.equal(readWatermarks(dir)["sess-long-9999"].lastMessageTs, hIso(2, 1), "the detached run stamps the watermark");
+    assert.equal(loadBrain(dir).notes.length, 0, "still report-only");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(sessionCwd, { recursive: true, force: true });
+  }
+});
+
+check("cli install-hook: surgically merges our SessionEnd entry; unrelated keys and hooks survive; idempotent; uninstall restores", () => {
+  const file = path.join(tmpdir("brain-v7-settings-"), "settings.json");
+  const before = {
+    model: "opus",
+    theme: "dark",
+    hooks: {
+      PostToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: "echo post-tool" }] }],
+      SessionEnd: [{ hooks: [{ type: "command", command: "echo unrelated-session-end" }] }],
+    },
+  };
+  fs.writeFileSync(file, JSON.stringify(before, null, 2));
+  const r = runCli(["install-hook", "--settings", file]);
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(r.stdout.includes("installed a SessionEnd hook"), r.stdout);
+  assert.ok(r.stdout.includes("report-only"), "install must say unattended runs never apply");
+  const after = JSON.parse(fs.readFileSync(file, "utf8"));
+  assert.equal(after.model, "opus");
+  assert.equal(after.theme, "dark");
+  assert.deepEqual(after.hooks.PostToolUse, before.hooks.PostToolUse, "other hook events are untouched");
+  assert.equal(after.hooks.SessionEnd.length, 2, "our group is appended; the unrelated one is preserved");
+  assert.deepEqual(after.hooks.SessionEnd[0], before.hooks.SessionEnd[0]);
+  const ours = after.hooks.SessionEnd[1].hooks[0];
+  assert.equal(ours.type, "command");
+  assert.ok(ours.command.includes("cookbook-brain"), "ours is identified by its command string");
+  assert.ok(ours.command.endsWith("hook-run"), ours.command);
+  // idempotent: a second install changes nothing
+  const again = runCli(["install-hook", "--settings", file]);
+  assert.equal(again.status, 0);
+  assert.ok(again.stdout.includes("already installed"), again.stdout);
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), after);
+  // uninstall removes ONLY ours and restores the pre-install shape exactly
+  const un = runCli(["uninstall-hook", "--settings", file]);
+  assert.equal(un.status, 0, un.stderr);
+  assert.ok(un.stdout.includes("removed 1 cookbook-brain hook"), un.stdout);
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), before, "uninstall restores exactly the pre-install settings");
+  // uninstalling again is a polite no-op
+  const unAgain = runCli(["uninstall-hook", "--settings", file]);
+  assert.equal(unAgain.status, 0);
+  assert.ok(unAgain.stdout.includes("nothing was changed"), unAgain.stdout);
+});
+
+check("cli install-hook: creates a missing settings file; uninstall prunes the empty hooks object it added", () => {
+  const file = path.join(tmpdir("brain-v7-settings2-"), "nested", "settings.json");
+  const r = runCli(["install-hook", "--settings", file]);
+  assert.equal(r.status, 0, r.stderr);
+  const created = JSON.parse(fs.readFileSync(file, "utf8"));
+  assert.equal(created.hooks.SessionEnd.length, 1);
+  assert.ok(created.hooks.SessionEnd[0].hooks[0].command.includes("cookbook-brain"));
+  const un = runCli(["uninstall-hook", "--settings", file]);
+  assert.equal(un.status, 0, un.stderr);
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), {}, "nothing of ours may be left behind");
+  // uninstall against a missing file is a polite no-op too
+  const missing = runCli(["uninstall-hook", "--settings", path.join(os.tmpdir(), "definitely-missing-settings.json")]);
+  assert.equal(missing.status, 0);
+  assert.ok(missing.stdout.includes("nothing to remove"), missing.stdout);
+});
+
+check("cli install-hook + uninstall-hook: refuse malformed settings and change nothing", () => {
+  const file = path.join(tmpdir("brain-v7-settings3-"), "settings.json");
+  fs.writeFileSync(file, "{ this is not json");
+  const bytes = fs.readFileSync(file, "utf8");
+  const r = runCli(["install-hook", "--settings", file]);
+  assert.equal(r.status, 1, "a file we cannot parse must refuse, never clobber");
+  assert.ok(r.stderr.includes("refusing to touch"), r.stderr);
+  assert.ok(r.stderr.includes("Nothing was changed"), r.stderr);
+  assert.equal(fs.readFileSync(file, "utf8"), bytes, "the malformed file must stay byte-identical");
+  const un = runCli(["uninstall-hook", "--settings", file]);
+  assert.equal(un.status, 1);
+  assert.equal(fs.readFileSync(file, "utf8"), bytes);
+  // a parseable file whose hooks value cannot be edited safely also refuses
+  fs.writeFileSync(file, JSON.stringify({ hooks: "what even is this" }));
+  const bad = runCli(["install-hook", "--settings", file]);
+  assert.equal(bad.status, 1);
+  assert.ok(bad.stderr.includes('"hooks" value is not an object'), bad.stderr);
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), { hooks: "what even is this" });
+  fs.writeFileSync(file, JSON.stringify({ hooks: { SessionEnd: "also wrong" } }));
+  const bad2 = runCli(["install-hook", "--settings", file]);
+  assert.equal(bad2.status, 1);
+  assert.ok(bad2.stderr.includes("SessionEnd"), bad2.stderr);
+});
+
+check("cli log: surfaces recent harvest reports with kept-but-unapplied proposals", () => {
+  const dir = tmpdir("brain-v7-pending-");
+  try {
+    createNote(dir, { type: "note", title: "A note", body: "x", author: { human: "d", agent: null } });
+    const dreams = path.join(dir, "dreams");
+    fs.mkdirSync(dreams);
+    assert.ok(!runCli(["log", "--dir", dir]).stdout.includes("unapplied keeps"), "no reports, no line");
+    // a recent report-only report with a keep: pending
+    fs.writeFileSync(
+      path.join(dreams, "HARVEST_2026-08-18.md"),
+      ["# Harvest report", "## Refuter review", "refuter: ran", "- proposal 0: keep. Supported by the digests.", "## Applied", "report-only run: nothing was applied. Re-run with --apply to write the kept notes."].join("\n"),
+    );
+    // an APPLIED report with keeps: not pending
+    fs.writeFileSync(
+      path.join(dreams, "HARVEST_2026-08-17.md"),
+      ["# Harvest report", "## Refuter review", "refuter: ran", "- proposal 0: keep. Supported.", "## Applied", '- proposal 0: wrote decision "X" (x.md)'].join("\n"),
+    );
+    // a report-only report with only rejects: not pending
+    fs.writeFileSync(
+      path.join(dreams, "HARVEST_2026-08-16.md"),
+      ["# Harvest report", "## Refuter review", "- proposal 0: reject. Unsupported.", "## Applied", "report-only run: nothing was applied."].join("\n"),
+    );
+    // a dream report never trips the harvest line
+    fs.writeFileSync(path.join(dreams, "DREAM_2026-08-18.md"), ["- proposal 0: keep. Fine.", "report-only run: nothing was applied."].join("\n"));
+    // an old pending report ages out of "recent"
+    const old = path.join(dreams, "HARVEST_2026-07-01.md");
+    fs.writeFileSync(old, ["- proposal 0: keep. Old.", "report-only run: nothing was applied."].join("\n"));
+    fs.utimesSync(old, new Date(Date.now() - 8 * DAY), new Date(Date.now() - 8 * DAY));
+    assert.equal(pendingHarvestKeeps(dir), 1, "exactly one recent report-only report holds unapplied keeps");
+    const r = runCli(["log", "--dir", dir]);
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(r.stdout.includes("1 harvest report(s) with unapplied keeps: review with cookbook-brain harvest --apply"), r.stdout);
+    assert.equal(pendingHarvestKeeps(tmpdir("brain-v7-nodreams-")), 0, "a brain without dreams/ counts zero");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+fs.rmSync(v7ShimDir, { recursive: true, force: true });
 
 if (failures > 0) {
   console.error(`\n${failures} test(s) FAILED`);

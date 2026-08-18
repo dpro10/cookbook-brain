@@ -14,12 +14,18 @@
  *   dream    offline consolidation: propose, refute, and (with --apply) apply
  *   harvest  bootstrap memory from local Claude Code transcripts: digest,
  *            propose, refute, and (with --apply) write new notes
+ *   install-hook    register a Claude Code SessionEnd hook so sessions
+ *                   harvest themselves on close (always report-only)
+ *   uninstall-hook  remove exactly that hook, touching nothing else
+ *   hook-run        the hook's target: read the SessionEnd JSON on stdin and
+ *                   spawn a detached report-only harvest of that one session
  *
  * The brain directory resolves as: --dir flag, then the BRAIN_DIR environment
  * variable, then ./brain.
  */
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import {
   INDEX_FILENAME,
@@ -59,6 +65,12 @@ Commands:
   harvest         bootstrap memory from your local Claude Code sessions:
                   digest recent transcripts, propose atomic notes, and have an
                   adversarial refuter review them; report-only unless --apply
+  install-hook    register a Claude Code SessionEnd hook in
+                  ~/.claude/settings.json so every session harvests itself
+                  when it closes (detached, incremental, ALWAYS report-only)
+  uninstall-hook  remove exactly that hook from settings.json, nothing else
+  hook-run        used by the hook: reads the SessionEnd JSON on stdin and
+                  spawns a detached harvest --session <id> --since-last
 
 Options:
   --dir <path>   brain directory (default ./brain; BRAIN_DIR env also works)
@@ -73,8 +85,15 @@ Options:
   --model <id>   dream/harvest: model id passed to claude -p --model (default: your claude setting)
   --dry-digest   dream/harvest: print exactly what would be sent to the model, then exit
   --sessions <path>  harvest: transcripts root (default ~/.claude/projects)
-  --days <n>     harvest: how many days of sessions to scan (default 7)
+  --days <n>     harvest: how many days of sessions to scan (default 7;
+                 default 2 when --session is given)
   --project <name>   harvest: only sessions whose working directory basename matches
+  --session <id>     harvest: harvest exactly one session transcript
+  --since-last   harvest: digest only messages newer than each session's
+                 watermark in brain/dreams/harvested.json (incremental)
+  --settings <path>  install-hook/uninstall-hook: settings file to edit
+                 (default ~/.claude/settings.json)
+  --no-detach    hook-run: run the harvest inline instead of detached (tests)
   --help         show this help
 
 Hook it up to Claude Code:
@@ -230,6 +249,16 @@ detection. The brain trusts its own bootstrap more than a bare claim, but
 less than you. Harvest reports live in the \`dreams/\` subdirectory as
 \`HARVEST_<date>.md\`.
 
+Harvest also keeps per-session watermarks in \`dreams/harvested.json\`: a
+JSON map of session id to \`{ lastMessageTs, harvestedAt }\`, where
+\`lastMessageTs\` is the timestamp of the last message a successful harvest
+digested from that session. \`harvest --since-last\` digests only messages
+newer than each session's watermark, so long-lived sessions are harvested
+incrementally, and every successful harvest (report-only included) advances
+the file. It lives under \`dreams/\` so the note scanner never reads it, it
+is not a note, and deleting it is safe: the next harvest simply starts from
+the plain day window again.
+
 ## The generated index
 
 \`cookbook-brain index\` writes an INDEX.md file at this directory's root:
@@ -260,7 +289,17 @@ interface Args {
   /** harvest only */
   sessions?: string;
   days: number;
+  /** true when --days was given explicitly (so --session does not override it) */
+  daysExplicit: boolean;
   project?: string;
+  session?: string;
+  sinceLast: boolean;
+  /** true when the brain dir came from --dir or BRAIN_DIR rather than the ./brain default */
+  dirExplicit: boolean;
+  /** install-hook / uninstall-hook only */
+  settings?: string;
+  /** hook-run only: run the harvest inline instead of detached (tests) */
+  noDetach: boolean;
   /** doctor only */
   fixAliases: boolean;
   /** web only */
@@ -274,7 +313,7 @@ function fail(msg: string): never {
 }
 
 function parseArgs(argv: string[]): Args {
-  const args: Args = { command: null, rest: [], dir: "", limit: 20, apply: false, commit: false, json: false, dryDigest: false, days: 7, fixAliases: false, port: 4321 };
+  const args: Args = { command: null, rest: [], dir: "", limit: 20, apply: false, commit: false, json: false, dryDigest: false, days: 7, daysExplicit: false, sinceLast: false, dirExplicit: false, noDetach: false, fixAliases: false, port: 4321 };
   let dirFlag: string | undefined;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -306,6 +345,17 @@ function parseArgs(argv: string[]): Args {
       const n = Number(argv[++i]);
       if (!Number.isInteger(n) || n < 1) fail("--days requires a positive integer");
       args.days = n;
+      args.daysExplicit = true;
+    } else if (a === "--session") {
+      args.session = argv[++i];
+      if (!args.session) fail("--session requires a session id");
+    } else if (a === "--since-last") {
+      args.sinceLast = true;
+    } else if (a === "--settings") {
+      args.settings = argv[++i];
+      if (!args.settings) fail("--settings requires a path");
+    } else if (a === "--no-detach") {
+      args.noDetach = true;
     } else if (a === "--fix-aliases") {
       args.fixAliases = true;
     } else if (a === "--port") {
@@ -325,6 +375,7 @@ function parseArgs(argv: string[]): Args {
       fail(`unexpected argument: ${a}`);
     }
   }
+  args.dirExplicit = dirFlag !== undefined || !!process.env.BRAIN_DIR;
   args.dir = path.resolve(dirFlag ?? process.env.BRAIN_DIR ?? "./brain");
   return args;
 }
@@ -354,12 +405,22 @@ function fmtAuthor(n: Note): string {
   return n.author.agent ? `${n.author.human} via ${n.author.agent}` : n.author.human;
 }
 
-function cmdLog(dir: string, limit: number): void {
+async function cmdLog(dir: string, limit: number): Promise<void> {
   if (!fs.existsSync(dir)) fail(`no brain directory at ${dir} (run: cookbook-brain init)`);
+  const { pendingHarvestKeeps } = await import("./harvest.ts");
+  const pendingLine = (): void => {
+    // surface autoharvest output waiting on a human: recent report-only
+    // harvest reports whose refuter kept proposals nobody has applied yet
+    const pending = pendingHarvestKeeps(dir);
+    if (pending > 0) {
+      console.log(`\n${pending} harvest report(s) with unapplied keeps: review with cookbook-brain harvest --apply`);
+    }
+  };
   const brain = loadBrain(dir);
   const notes = [...brain.notes].sort((a, b) => (a.id > b.id ? -1 : 1)).slice(0, limit);
   if (notes.length === 0) {
     console.log(`[cookbook-brain] ${dir} has no notes yet`);
+    pendingLine();
     return;
   }
   const active = activeNotes(brain).length;
@@ -373,6 +434,7 @@ function cmdLog(dir: string, limit: number): void {
   if (brain.problems.length > 0) {
     console.log(`\n${brain.problems.length} file(s) had problems; run: cookbook-brain doctor`);
   }
+  pendingLine();
 }
 
 function cmdCredit(dir: string, ids: string[]): void {
@@ -591,13 +653,23 @@ async function cmdDream(args: Args): Promise<void> {
 
 async function cmdHarvest(args: Args): Promise<void> {
   if (!fs.existsSync(args.dir)) fail(`no brain directory at ${args.dir} (run: cookbook-brain init)`);
-  const { DEFAULT_SESSIONS_ROOT, buildHarvestDigest, harvest, harvestProposerPrompt, scanSessions } = await import("./harvest.ts");
+  const { DEFAULT_SESSIONS_ROOT, buildHarvestDigest, harvest, harvestProposerPrompt, readWatermarks, scanSessions } = await import("./harvest.ts");
   const { findClaudeBinary } = await import("./dream.ts");
   const sessionsRoot = args.sessions ? path.resolve(args.sessions) : DEFAULT_SESSIONS_ROOT;
+  // --session mode narrows the default window to a generous 2 days: one
+  // transcript is being harvested (usually the session that just closed), so
+  // the week-wide default would only invite unrelated stale content. An
+  // explicit --days always wins.
+  const days = args.session && !args.daysExplicit ? 2 : args.days;
 
   if (args.dryDigest) {
     // Trust feature: print exactly what would leave for the proposer model, make no calls.
-    const scanned = scanSessions(sessionsRoot, { days: args.days, project: args.project });
+    const scanned = scanSessions(sessionsRoot, {
+      days,
+      project: args.project,
+      sessionId: args.session,
+      watermarks: args.sinceLast ? readWatermarks(args.dir) : undefined,
+    });
     process.stdout.write(harvestProposerPrompt(buildHarvestDigest(scanned.sessions).text));
     return;
   }
@@ -617,8 +689,10 @@ async function cmdHarvest(args: Args): Promise<void> {
   const outcome = harvest({
     dir: args.dir,
     sessionsRoot,
-    days: args.days,
+    days,
     project: args.project,
+    sessionId: args.session,
+    sinceLast: args.sinceLast,
     apply: args.apply,
     model: args.model,
     human: humanName(),
@@ -633,12 +707,16 @@ async function cmdHarvest(args: Args): Promise<void> {
           date: new Date().toISOString(),
           brain: args.dir,
           sessions_root: sessionsRoot,
-          days: args.days,
+          days,
           project: args.project ?? null,
+          session: args.session ?? null,
+          since_last: args.sinceLast,
           mode: args.apply ? "apply" : "report-only",
           sessions_scanned: outcome.sessionsScanned,
           internal_runs_skipped: outcome.internalRuns,
           no_in_window: outcome.noInWindow,
+          up_to_date: outcome.upToDate,
+          watermarks_updated: outcome.watermarksUpdated,
           sessions_digested: outcome.sessionsDigested,
           dropped_for_budget: outcome.droppedForBudget,
           proposals: outcome.proposals,
@@ -660,8 +738,9 @@ async function cmdHarvest(args: Args): Promise<void> {
   }
 
   console.log(
-    `cookbook-brain harvest: ${outcome.sessionsScanned} session(s) in the last ${args.days} day(s), ${outcome.sessionsDigested} digested` +
+    `cookbook-brain harvest: ${outcome.sessionsScanned} session(s) in the last ${days} day(s), ${outcome.sessionsDigested} digested` +
       (outcome.internalRuns > 0 ? `, ${outcome.internalRuns} internal tool run(s) skipped` : "") +
+      (outcome.upToDate > 0 ? `, ${outcome.upToDate} already up to date (watermark)` : "") +
       (outcome.droppedForBudget.length > 0 ? `, ${outcome.droppedForBudget.length} dropped for the digest budget` : ""),
   );
   console.log(
@@ -682,6 +761,243 @@ async function cmdHarvest(args: Args): Promise<void> {
   console.log(`report: ${outcome.reportFile}`);
 }
 
+// ---- autoharvest: the SessionEnd hook ----
+
+/**
+ * Where the Claude Code hook is registered. install-hook and uninstall-hook
+ * edit exactly one entry in this file and refuse to touch anything they do
+ * not fully parse. --settings overrides, which is also how the hermetic
+ * tests and sandboxed live verifies keep the real file out of reach.
+ */
+const DEFAULT_SETTINGS_PATH = path.join(os.homedir(), ".claude", "settings.json");
+
+/** Ours is any hook command containing this substring; nothing else is ever touched. */
+const HOOK_MATCH_SUBSTRING = "cookbook-brain";
+
+/** Where detached hook-run harvests append their JSON reports. */
+const AUTOHARVEST_LOG = path.join(os.homedir(), ".cookbook-brain-autoharvest.log");
+
+interface HookEntry {
+  type?: unknown;
+  command?: unknown;
+  [key: string]: unknown;
+}
+
+interface HookGroup {
+  matcher?: unknown;
+  hooks?: HookEntry[] | unknown;
+  [key: string]: unknown;
+}
+
+/**
+ * The exact command string the hook runs: this Node binary, this CLI script,
+ * `hook-run`. Absolute paths on purpose: hooks run with an arbitrary cwd and
+ * an unknown PATH, and an npx round-trip would add seconds to every session
+ * close. Paths with whitespace or quotes are JSON-quoted for the shell.
+ */
+function hookCommand(): string {
+  const quote = (s: string) => (/[\s"']/.test(s) ? JSON.stringify(s) : s);
+  return `${quote(process.execPath)} ${quote(path.resolve(process.argv[1]))} hook-run`;
+}
+
+/** Parse the settings file or refuse loudly. A missing file parses as {}. Never returns on failure. */
+function readSettingsOrRefuse(settingsPath: string): Record<string, unknown> {
+  if (!fs.existsSync(settingsPath)) return {};
+  const text = fs.readFileSync(settingsPath, "utf8");
+  try {
+    const parsed = JSON.parse(text);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      throw new Error("the top level is not a JSON object");
+    }
+    return parsed as Record<string, unknown>;
+  } catch (e) {
+    console.error(`[cookbook-brain] refusing to touch ${settingsPath}: it does not parse as a JSON object (${(e as Error).message}).`);
+    console.error("Fix or restore the file by hand, then re-run. Nothing was changed.");
+    process.exit(1);
+  }
+}
+
+function writeSettings(settingsPath: string, obj: Record<string, unknown>): void {
+  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+  fs.writeFileSync(settingsPath, JSON.stringify(obj, null, 2) + "\n");
+}
+
+/** The SessionEnd groups array, validating shape without disturbing anything else. Never returns on a shape it cannot edit safely. */
+function sessionEndGroups(obj: Record<string, unknown>, settingsPath: string, createMissing: boolean): HookGroup[] | null {
+  const refuse = (what: string): never => {
+    console.error(`[cookbook-brain] refusing to touch ${settingsPath}: ${what}. Nothing was changed.`);
+    process.exit(1);
+  };
+  if (obj.hooks === undefined) {
+    if (!createMissing) return null;
+    obj.hooks = {};
+  }
+  if (typeof obj.hooks !== "object" || obj.hooks === null || Array.isArray(obj.hooks)) {
+    refuse('its "hooks" value is not an object');
+  }
+  const hooks = obj.hooks as Record<string, unknown>;
+  if (hooks.SessionEnd === undefined) {
+    if (!createMissing) return null;
+    hooks.SessionEnd = [];
+  }
+  if (!Array.isArray(hooks.SessionEnd)) refuse('its "hooks.SessionEnd" value is not an array');
+  return hooks.SessionEnd as HookGroup[];
+}
+
+/** Every hook entry across the SessionEnd groups whose command contains the cookbook-brain substring. */
+function ourEntries(groups: HookGroup[]): HookEntry[] {
+  const out: HookEntry[] = [];
+  for (const group of groups) {
+    if (!Array.isArray(group?.hooks)) continue;
+    for (const h of group.hooks as HookEntry[]) {
+      if (typeof h?.command === "string" && h.command.includes(HOOK_MATCH_SUBSTRING)) out.push(h);
+    }
+  }
+  return out;
+}
+
+/**
+ * install-hook: register the SessionEnd hook, surgically. Parse the whole
+ * settings file (refusing if it does not parse), deep-merge ONLY our one
+ * entry (found by its command string containing "cookbook-brain"), and write
+ * back pretty-printed. Every other key, hook event, and matcher group is
+ * carried through byte-for-byte in structure.
+ */
+function cmdInstallHook(settingsPath: string): void {
+  const command = hookCommand();
+  const obj = readSettingsOrRefuse(settingsPath);
+  const groups = sessionEndGroups(obj, settingsPath, true)!;
+  const existing = ourEntries(groups);
+  if (existing.length > 0) {
+    if (existing.every((h) => h.command === command)) {
+      console.log(`cookbook-brain: the SessionEnd hook is already installed in ${settingsPath}`);
+      console.log(`  ${command}`);
+      return;
+    }
+    for (const h of existing) h.command = command; // ours, but stale (moved install or node): update in place
+    writeSettings(settingsPath, obj);
+    console.log(`cookbook-brain: updated the existing SessionEnd hook in ${settingsPath}`);
+    console.log(`  ${command}`);
+    return;
+  }
+  groups.push({ hooks: [{ type: "command", command }] });
+  writeSettings(settingsPath, obj);
+  console.log(`cookbook-brain: installed a SessionEnd hook in ${settingsPath}`);
+  console.log(`  ${command}`);
+  console.log(
+    [
+      "",
+      "From now on, every Claude Code session harvests itself when it closes:",
+      "a detached `harvest --session <id> --since-last` runs against the session's",
+      "working directory, ALWAYS report-only (unattended writes need your eyes).",
+      `Its output appends to ${AUTOHARVEST_LOG}`,
+      "and reports land in brain/dreams/. Review kept proposals with:",
+      "  cookbook-brain harvest --apply",
+      "Sessions already running pick the hook up on their next restart.",
+      "Undo any time with: cookbook-brain uninstall-hook",
+    ].join("\n"),
+  );
+}
+
+/** uninstall-hook: remove ONLY our entries; empty structures we leave behind are pruned, everything else is untouched. */
+function cmdUninstallHook(settingsPath: string): void {
+  if (!fs.existsSync(settingsPath)) {
+    console.log(`cookbook-brain: nothing to remove (${settingsPath} does not exist)`);
+    return;
+  }
+  const obj = readSettingsOrRefuse(settingsPath);
+  const groups = sessionEndGroups(obj, settingsPath, false);
+  const found = groups ? ourEntries(groups).length : 0;
+  if (!groups || found === 0) {
+    console.log(`cookbook-brain: no cookbook-brain SessionEnd hook found in ${settingsPath}; nothing was changed`);
+    return;
+  }
+  const remaining = groups
+    .map((group) => {
+      if (!Array.isArray(group?.hooks)) return group;
+      const kept = (group.hooks as HookEntry[]).filter(
+        (h) => !(typeof h?.command === "string" && h.command.includes(HOOK_MATCH_SUBSTRING)),
+      );
+      return { ...group, hooks: kept };
+    })
+    .filter((group) => !Array.isArray(group?.hooks) || (group.hooks as HookEntry[]).length > 0);
+  const hooks = obj.hooks as Record<string, unknown>;
+  if (remaining.length > 0) hooks.SessionEnd = remaining;
+  else delete hooks.SessionEnd;
+  if (Object.keys(hooks).length === 0) delete obj.hooks;
+  writeSettings(settingsPath, obj);
+  console.log(`cookbook-brain: removed ${found} cookbook-brain hook entr${found === 1 ? "y" : "ies"} from ${settingsPath}`);
+  console.log("Every other setting and hook was left untouched. Running sessions notice on their next restart.");
+}
+
+interface SessionEndPayload {
+  session_id?: unknown;
+  transcript_path?: unknown;
+  cwd?: unknown;
+}
+
+/**
+ * hook-run: the SessionEnd hook's target. Claude Code pipes a JSON payload
+ * (session_id, transcript_path, cwd, ...) on stdin when a session closes.
+ * This command must never delay or break session close, so every exit path
+ * is exit 0, and the real work happens in a DETACHED child:
+ *
+ *   harvest --session <id> --since-last --json >> ~/.cookbook-brain-autoharvest.log 2>&1
+ *
+ * ALWAYS report-only: --apply is deliberately impossible from hook mode,
+ * because unattended writes to your memory need the human's eyes first.
+ * Kept proposals accumulate in the reports and surface in `cookbook-brain
+ * log`. Recursion guard: sessions whose transcript opens with one of this
+ * tool's own prompts (its harvest/dream `claude -p` calls) are skipped
+ * outright, so autoharvest never harvests itself.
+ */
+async function cmdHookRun(args: Args): Promise<void> {
+  let payload: SessionEndPayload;
+  try {
+    payload = JSON.parse(fs.readFileSync(0, "utf8"));
+  } catch {
+    process.exit(0); // unreadable stdin: not our place to complain at session close
+  }
+  const sessionId = typeof payload.session_id === "string" ? payload.session_id.trim() : "";
+  if (!sessionId) process.exit(0);
+
+  // recursion guard: our own claude -p runs end sessions too
+  const { isInternalRunPrompt, transcriptFirstUserText } = await import("./harvest.ts");
+  if (typeof payload.transcript_path === "string" && payload.transcript_path) {
+    const first = transcriptFirstUserText(payload.transcript_path);
+    if (first !== null && isInternalRunPrompt(first)) process.exit(0);
+  }
+
+  const harvestArgs = ["harvest", "--session", sessionId, "--since-last", "--json"];
+  if (args.sessions) harvestArgs.push("--sessions", args.sessions);
+  // pass the brain dir only when it was chosen explicitly; otherwise the
+  // child resolves ./brain against the SESSION'S working directory below
+  if (args.dirExplicit) harvestArgs.push("--dir", args.dir);
+  const cwd = typeof payload.cwd === "string" && payload.cwd && fs.existsSync(payload.cwd) ? payload.cwd : process.cwd();
+  const bin = path.resolve(process.argv[1]);
+
+  if (args.noDetach) {
+    // test mode: run the harvest inline and forward its output
+    const r = spawnSync(process.execPath, [bin, ...harvestArgs], { cwd, encoding: "utf8", timeout: 600_000 });
+    process.stdout.write(r.stdout ?? "");
+    process.stderr.write(r.stderr ?? "");
+    process.exit(0);
+  }
+
+  const logFile = process.env.COOKBOOK_BRAIN_AUTOHARVEST_LOG || AUTOHARVEST_LOG;
+  let fd: number;
+  try {
+    fd = fs.openSync(logFile, "a");
+  } catch {
+    process.exit(0); // no log target, no harvest; session close still succeeds
+  }
+  fs.writeSync(fd, `[cookbook-brain autoharvest] ${new Date().toISOString()} session ${sessionId} (${cwd})\n`);
+  const child = spawn(process.execPath, [bin, ...harvestArgs], { cwd, detached: true, stdio: ["ignore", fd, fd] });
+  child.unref();
+  fs.closeSync(fd);
+  process.exit(0); // instantly: the harvest continues without us
+}
+
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   switch (args.command) {
@@ -694,7 +1010,7 @@ async function main(): Promise<void> {
       break;
     }
     case "log":
-      cmdLog(args.dir, args.limit);
+      await cmdLog(args.dir, args.limit);
       break;
     case "credit":
       cmdCredit(args.dir, args.rest);
@@ -716,6 +1032,15 @@ async function main(): Promise<void> {
       break;
     case "harvest":
       await cmdHarvest(args);
+      break;
+    case "install-hook":
+      cmdInstallHook(path.resolve(args.settings ?? DEFAULT_SETTINGS_PATH));
+      break;
+    case "uninstall-hook":
+      cmdUninstallHook(path.resolve(args.settings ?? DEFAULT_SETTINGS_PATH));
+      break;
+    case "hook-run":
+      await cmdHookRun(args);
       break;
     case null:
       fail("no command given");
