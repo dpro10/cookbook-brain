@@ -9,9 +9,13 @@ Open the folder in Obsidian and you will see plain notes, because that is all it
 ## Quickstart
 
 ```
-npx cookbook-brain init          # creates ./brain with a schema note
+npx cookbook-brain init             # creates ./brain with a schema note
+npx cookbook-brain harvest          # propose notes distilled from your recent Claude Code sessions
+npx cookbook-brain harvest --apply  # write the proposals the refuter kept
 claude mcp add brain -- npx cookbook-brain serve
 ```
+
+Your brain starts full: before your first agent session ever connects, `harvest` reads your recent local Claude Code transcripts and distills the decisions, gotchas, and conventions already sitting in them into attributed notes (see "Harvest" below; it proposes only, until you say `--apply`).
 
 Then tell your agent: "remember that the staging DB resets nightly" and it is saved, attributed, and recalled in every future session. That is the whole loop.
 
@@ -127,11 +131,32 @@ Dreams are designed to run while you sleep. A plain crontab line does it:
 
 Leave off `--apply` and read the reports over coffee, or add it once you trust your refuter's taste. Either way, commit the brain afterwards so every dream is one revertable commit; `--apply --commit` does that commit for you.
 
+## Harvest: your brain starts full
+
+A new brain should not start empty while weeks of your real decisions sit in local session transcripts. `npx cookbook-brain harvest` reads your recent Claude Code sessions, distills them into atomic notes, and runs every proposal past the same adversarial refuter that reviews dreams. It is how a brain bootstraps on day one and how it tops up after a heavy week.
+
+```
+npx cookbook-brain harvest                  # report-only: propose notes from the last 7 days
+npx cookbook-brain harvest --days 30        # scan further back
+npx cookbook-brain harvest --project myapp  # only sessions whose working directory basename matches
+npx cookbook-brain harvest --apply          # write the notes the refuter kept
+npx cookbook-brain harvest --dry-digest     # print exactly what would be sent to the model, then exit
+npx cookbook-brain harvest --json           # machine-readable report on stdout (report file still written)
+npx cookbook-brain harvest --sessions <path> --model <id>   # override the transcripts root and the model
+```
+
+Straight answers to the questions you should be asking:
+
+- **What it reads.** Local Claude Code transcripts under `~/.claude/projects` (override with `--sessions`), from the last N days, and yes: it reads message CONTENT, the human's own messages and the assistant's main conclusions, because distilling content is the whole job. Tool traffic and subagent transcripts are skipped. This is the deliberate opposite of metadata-only tools; it is stated here so you never discover it by surprise.
+- **Where it sends it.** Compact per-session digests go to your own logged-in `claude` CLI, the same tool that produced the sessions in the first place. No API keys, no other network calls, nothing leaves your machine by any path your `claude` login does not already use. `--dry-digest` prints the exact outbound prompt.
+- **What it writes.** Nothing, by default. A report at `brain/dreams/HARVEST_<date>.md` lists every proposal, every dedupe skip (facts the brain already holds), and every refuter verdict, including the mandatory `refuter: ran` or `refuter: absent` line; an unreviewed harvest applies nothing, even with `--apply`. Only `--apply` writes notes, and an applied harvest only adds new files, so undoing it is `git revert` or deleting the listed files.
+- **The distrust property.** Harvested notes are authored `{ human: you, agent: "harvest" }`, and each body ends with a `source:` line citing its session (for example `source: session 2026-08-15, project cookbook-app`). That citation earns the sourced-agent confidence cap (0.85) through the ordinary source detection, nothing special-cased: the brain trusts its own bootstrap more than a bare claim, but less than you, until real work credits the notes upward.
+
 ## What it is not
 
 - Not a vector database (see "Why files" above; optional embeddings may come later, and will never be required).
 - Not hosted. One brain, one owner, any number of YOUR agents.
-- Not a chat log. It stores atomic, deliberate notes, not transcripts.
+- Not a chat log. It stores atomic, deliberate notes, not transcripts; even `harvest`, which reads your sessions, distills them into single-fact notes and never stores a transcript.
 
 ## Can my team share a brain?
 
