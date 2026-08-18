@@ -34,6 +34,13 @@ export interface Note {
   author: Author;
   created: string;
   supersedes: string | null;
+  /**
+   * optional provenance citation: where this fact comes from (a URL, a file
+   * path, a ticket id). Present only when the author cited one. A note with a
+   * source field earns the sourced-agent confidence cap (0.85), same as the
+   * body heuristic (a `source:` line or URL in the body).
+   */
+  source?: string;
   /** present only on notes that have been superseded */
   superseded_by?: string;
   /**
@@ -53,6 +60,12 @@ export interface Note {
   claimed_by?: string | null;
   /** task notes only: short outcome string stamped on completion, or null until done */
   result?: string | null;
+  /**
+   * task notes only: why the previous claimer gave the task back, recorded
+   * when a claimed task is abandoned. Cleared on the next claim so a fresh
+   * claimer starts clean; the reason survives in git history.
+   */
+  abandon_reason?: string | null;
   body: string;
   /** absolute path of the file this note was read from or written to */
   file: string;
@@ -160,6 +173,7 @@ export function serializeNote(note: Omit<Note, "file">): string {
     `created: ${note.created}`,
     `supersedes: ${fmScalar(note.supersedes)}`,
   ];
+  if (note.source !== undefined) lines.push(`source: ${fmScalar(note.source)}`);
   if (note.consolidates !== undefined) lines.push(`consolidates: [${note.consolidates.map(fmScalar).join(", ")}]`);
   if (note.superseded_by !== undefined) lines.push(`superseded_by: ${fmScalar(note.superseded_by)}`);
   lines.push(`credits: ${note.credits}`);
@@ -169,6 +183,7 @@ export function serializeNote(note: Omit<Note, "file">): string {
     lines.push(`assigned_to: ${fmScalar(note.assigned_to ?? null)}`);
     lines.push(`claimed_by: ${fmScalar(note.claimed_by ?? null)}`);
     lines.push(`result: ${fmScalar(note.result ?? null)}`);
+    if (note.abandon_reason != null) lines.push(`abandon_reason: ${fmScalar(note.abandon_reason)}`);
   }
   lines.push("---", "");
   const body = note.body.replace(/\s+$/, "");
@@ -231,6 +246,12 @@ export function parseNoteFile(file: string, content: string): ParsedFile {
   if (!created || !ISO_RE.test(created)) problems.push(`created is not an ISO timestamp: ${created ?? "(missing)"}`);
   const supersedes = fields.has("supersedes") ? get("supersedes") : undefined;
   if (supersedes === undefined) problems.push("missing supersedes (use null for original notes)");
+  let source: string | undefined;
+  if (fields.has("source")) {
+    const parsedSource = get("source");
+    if (parsedSource === null) problems.push("source must be a non-empty string when present (omit the field instead of leaving it blank)");
+    else source = parsedSource;
+  }
   const supersededBy = fields.has("superseded_by") ? get("superseded_by") : undefined;
   let consolidates: string[] | undefined;
   if (fields.has("consolidates")) {
@@ -258,6 +279,7 @@ export function parseNoteFile(file: string, content: string): ParsedFile {
   let assignedTo: string | null | undefined;
   let claimedBy: string | null | undefined;
   let result: string | null | undefined;
+  let abandonReason: string | null | undefined;
   if (type === "task") {
     const statusRaw = get("status");
     if (!statusRaw || !TASK_STATUSES.includes(statusRaw as TaskStatus)) {
@@ -271,6 +293,8 @@ export function parseNoteFile(file: string, content: string): ParsedFile {
     if (claimedBy === undefined) problems.push("missing claimed_by (use null while the task is open)");
     result = fields.has("result") ? get("result") : undefined;
     if (result === undefined) problems.push("missing result (use null until the task is done)");
+    // optional: only abandoned-then-reopened tasks carry it
+    abandonReason = fields.has("abandon_reason") ? get("abandon_reason") : undefined;
   }
 
   if (problems.length > 0) return { problems };
@@ -291,6 +315,7 @@ export function parseNoteFile(file: string, content: string): ParsedFile {
       .replace(/\s+$/, ""),
     file,
   };
+  if (source !== undefined) note.source = source;
   if (supersededBy != null) note.superseded_by = supersededBy;
   if (consolidates !== undefined) note.consolidates = consolidates;
   if (type === "task") {
@@ -298,6 +323,7 @@ export function parseNoteFile(file: string, content: string): ParsedFile {
     note.assigned_to = assignedTo ?? null;
     note.claimed_by = claimedBy ?? null;
     note.result = result ?? null;
+    if (abandonReason != null) note.abandon_reason = abandonReason;
   }
   return { note, problems: [] };
 }
@@ -359,6 +385,16 @@ export function activeNotes(brain: Brain): Note[] {
   return brain.notes.filter((n) => n.superseded_by === undefined);
 }
 
+/**
+ * Every active convention-type note, oldest first. Recall carries these
+ * verbatim in a dedicated `conventions` section regardless of the query,
+ * because standing rules apply to all work, not just work that searched for
+ * them. Conventions are short by nature, so no truncation.
+ */
+export function activeConventions(brain: Brain): Note[] {
+  return activeNotes(brain).filter((n) => n.type === "convention");
+}
+
 // ---- writing ----
 
 export interface CreateInput {
@@ -367,6 +403,8 @@ export interface CreateInput {
   body: string;
   author: Author;
   supersedes?: string | null;
+  /** optional provenance citation: URL, file path, ticket id. Cited memory is auditable memory. */
+  source?: string;
   /** dream merge/promote notes only: ids of the notes being consolidated */
   consolidates?: string[];
   created?: string;
@@ -393,6 +431,7 @@ export function createNote(dir: string, input: CreateInput): Note {
     last_credited: null,
     body: input.body.trim(),
   };
+  if (input.source?.trim()) note.source = input.source.trim();
   if (input.consolidates !== undefined) {
     if (input.consolidates.length === 0) throw new Error("consolidates must list at least one note id");
     note.consolidates = [...input.consolidates];
@@ -416,8 +455,8 @@ export function createNote(dir: string, input: CreateInput): Note {
  * Rewrite one existing note file with stamped frontmatter. Bodies are
  * append-only forever; this helper exists only for the three sanctioned
  * in-place stamps: superseded_by, the credit counters (credits +
- * last_credited), and the task lifecycle fields (status, claimed_by, result)
- * on task-type notes.
+ * last_credited), and the task lifecycle fields (status, claimed_by, result,
+ * abandon_reason) on task-type notes.
  */
 function stampNote(note: Note): Note {
   const { file: _f, ...rest } = note;
@@ -504,6 +543,8 @@ export interface AssignTaskInput {
   instructions: string;
   /** agent label to address, or null/omitted so any agent may take it */
   assigned_to?: string | null;
+  /** optional provenance citation for the task's instructions */
+  source?: string;
   author: Author;
   created?: string;
   id?: string;
@@ -523,6 +564,7 @@ export function assignTask(dir: string, input: AssignTaskInput): Note {
     body: input.instructions,
     author: input.author,
     assigned_to: input.assigned_to ?? null,
+    source: input.source,
     created: input.created,
     id: input.id,
   });
@@ -539,7 +581,9 @@ function getTask(brain: Brain, id: string): Note {
 /**
  * Claim an open task. Refuses if the task is already claimed or done, and
  * refuses a claim by an agent the task was not addressed to (assigned_to
- * null means anyone may claim). Stamps status + claimed_by in place.
+ * null means anyone may claim). Stamps status + claimed_by in place, and
+ * clears any abandon_reason left by a previous claimer so the fresh claim
+ * starts clean (the old reason survives in git history).
  */
 export function claimTask(dir: string, id: string, claimedBy: string): Note {
   const label = claimedBy.trim();
@@ -550,7 +594,28 @@ export function claimTask(dir: string, id: string, claimedBy: string): Note {
   if (task.assigned_to !== null && !labelsMatch(task.assigned_to, label)) {
     throw new Error(`task ${id} is assigned to ${task.assigned_to}, not ${label}`);
   }
-  return stampNote({ ...task, status: "claimed", claimed_by: label });
+  const { abandon_reason: _cleared, ...rest } = task;
+  return stampNote({ ...rest, status: "claimed", claimed_by: label });
+}
+
+/**
+ * Abandon a claimed task: hand it back loudly instead of leaving it to rot.
+ * The task returns to open with claimed_by cleared and the reason recorded
+ * in the abandon_reason frontmatter field, so the assigner sees WHY it came
+ * back. Only the claimer may abandon, and a reason is required: failure
+ * visibility is the point. The reason is cleared on the next claim.
+ */
+export function abandonTask(dir: string, id: string, reason: string, abandonedBy: string): Note {
+  const label = abandonedBy.trim();
+  if (!label) throw new Error("abandon requires the abandoning agent's label");
+  if (!reason.trim()) throw new Error("abandon requires a reason: the assigner needs to know why the task came back");
+  const task = getTask(loadBrain(dir), id);
+  if (task.status === "done") throw new Error(`task ${id} is already done (result: ${task.result ?? "none"})`);
+  if (task.status !== "claimed") throw new Error(`task ${id} is not claimed, so there is nothing to abandon`);
+  if (!labelsMatch(task.claimed_by, label)) {
+    throw new Error(`task ${id} is claimed by ${task.claimed_by}, not ${label}; only the claimer may abandon it`);
+  }
+  return stampNote({ ...task, status: "open", claimed_by: null, abandon_reason: reason.trim() });
 }
 
 /**
@@ -661,10 +726,16 @@ export function isSourced(body: string): boolean {
   return SOURCE_LINE_RE.test(body) || URL_RE.test(body);
 }
 
-/** The provenance ceiling: human 0.95, agent with a cited source 0.85, bare agent claim 0.60. No amount of crediting lifts a note past its cap. */
+/**
+ * The provenance ceiling: human 0.95, agent with a cited source 0.85, bare
+ * agent claim 0.60. A citation counts from EITHER the formal `source`
+ * frontmatter field or the body heuristic (a `source:` line or URL), so
+ * older brains keep their caps unchanged. No amount of crediting lifts a
+ * note past its cap.
+ */
 export function capFor(note: Note): number {
   if (note.author.agent === null) return 0.95;
-  return isSourced(note.body) ? 0.85 : 0.6;
+  return note.source !== undefined || isSourced(note.body) ? 0.85 : 0.6;
 }
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -861,6 +932,84 @@ export function diagnose(dir: string): BrainProblem[] {
     }
   }
   return problems;
+}
+
+// ---- brain lock ----
+
+/**
+ * The brain lock: a small JSON file at brain/.lock that a dream --apply
+ * holds while it writes, so MCP write tools do not interleave with a
+ * consolidation in flight. Reads never look at it. A lock older than
+ * LOCK_STALE_MS (a crashed apply) is stale: it never blocks anyone, and the
+ * next acquirer overrides it with a warning.
+ */
+export const LOCK_FILENAME = ".lock";
+export const LOCK_STALE_MS = 10 * 60 * 1000;
+
+export interface BrainLock {
+  pid: number;
+  timestamp: string;
+}
+
+export function lockPath(dir: string): string {
+  return path.join(dir, LOCK_FILENAME);
+}
+
+/** The raw lock file contents, or null when there is none (or it is unreadable garbage). */
+export function readLock(dir: string): BrainLock | null {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(lockPath(dir), "utf8")) as BrainLock;
+    if (typeof parsed?.pid !== "number" || typeof parsed?.timestamp !== "string") return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+/** The lock, but only while it is fresh. Stale or missing locks return null and block nobody. */
+export function activeLock(dir: string, now: number = Date.now()): BrainLock | null {
+  const lock = readLock(dir);
+  if (!lock) return null;
+  const age = now - Date.parse(lock.timestamp);
+  if (Number.isNaN(age) || age >= LOCK_STALE_MS) return null;
+  return lock;
+}
+
+/**
+ * Take the brain lock for an apply. Refuses while another process holds a
+ * fresh lock; overrides a stale one (reporting that it did, so the caller
+ * can warn). Always pair with releaseLock in a finally block.
+ */
+export function acquireLock(dir: string, now: number = Date.now()): { lock: BrainLock; overrodeStale: boolean } {
+  const existing = readLock(dir);
+  const fresh = activeLock(dir, now);
+  if (fresh && fresh.pid !== process.pid) {
+    throw new Error(
+      `brain is locked by another apply (pid ${fresh.pid}, since ${fresh.timestamp}); wait for it to finish, or if it crashed the lock goes stale after ${LOCK_STALE_MS / 60000} minutes`,
+    );
+  }
+  const lock: BrainLock = { pid: process.pid, timestamp: new Date(now).toISOString() };
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(lockPath(dir), JSON.stringify(lock));
+  return { lock, overrodeStale: existing !== null && fresh === null };
+}
+
+export function releaseLock(dir: string): void {
+  fs.rmSync(lockPath(dir), { force: true });
+}
+
+/**
+ * Guard for write paths (the MCP write tools): throw while a dream apply in
+ * ANOTHER process holds a fresh lock. Stale locks never block, and reads
+ * never call this.
+ */
+export function assertNotLocked(dir: string, now: number = Date.now()): void {
+  const lock = activeLock(dir, now);
+  if (lock && lock.pid !== process.pid) {
+    throw new Error(
+      `the brain is temporarily locked: a dream --apply (pid ${lock.pid}, since ${lock.timestamp}) is consolidating notes. Reads still work; retry this write in a moment.`,
+    );
+  }
 }
 
 // ---- attribution ----
