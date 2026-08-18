@@ -21,6 +21,7 @@ import {
   claimTask,
   completeTask,
   confidenceFor,
+  consolidateNotes,
   createNote,
   creditNotes,
   diagnose,
@@ -41,6 +42,7 @@ import {
   ulid,
   type Note,
 } from "../src/store.ts";
+import { buildDigest, extractJson, hygieneFindings } from "../src/dream.ts";
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 const BASIC = path.join(ROOT, "test", "fixtures", "basic-brain");
@@ -1101,6 +1103,490 @@ async function mcpTaskLifecycleTest(): Promise<void> {
 }
 
 await mcpTaskLifecycleTest();
+
+// ---- M3: consolidates field + consolidateNotes ----
+
+check("consolidates: serialize/parse round-trip preserves the id list", () => {
+  const note: Omit<Note, "file"> = {
+    id: ulid(),
+    type: "convention",
+    title: "Merged cache rules",
+    author: { human: "diego", agent: "dream" },
+    created: "2026-08-18T10:00:00.000Z",
+    supersedes: null,
+    consolidates: ["01J8A000000000000000000001", "01J8A000000000000000000003"],
+    credits: 0,
+    last_credited: null,
+    body: "One canonical statement of the cache rules.",
+  };
+  const parsed = parseNoteFile("x.md", serializeNote(note));
+  assert.deepEqual(parsed.problems, []);
+  const { file: _f, ...roundTripped } = parsed.note!;
+  assert.deepEqual(roundTripped, note);
+});
+
+check("consolidates: malformed and empty lists are parse problems, not crashes", () => {
+  const good = serializeNote({
+    id: ulid(),
+    type: "note",
+    title: "T",
+    author: { human: "d", agent: null },
+    created: "2026-08-18T10:00:00.000Z",
+    supersedes: null,
+    credits: 0,
+    last_credited: null,
+    body: "b",
+  });
+  const notAList = good.replace("supersedes: null", "supersedes: null\nconsolidates: just-some-id");
+  assert.ok(parseNoteFile("x.md", notAList).problems.some((p) => p.includes("bracketed")), "unbracketed value must be a problem");
+  const emptyList = good.replace("supersedes: null", "supersedes: null\nconsolidates: []");
+  assert.ok(parseNoteFile("x.md", emptyList).problems.some((p) => p.includes("at least one")), "empty list must be a problem");
+});
+
+check("consolidateNotes: writes the new note, stamps every source superseded_by, doctor stays clean", () => {
+  const dir = tmpdir("brain-consolidate-");
+  try {
+    const author = { human: "diego", agent: null };
+    const a = createNote(dir, { type: "note", title: "Cache rules", body: "first half of the fact", author });
+    const b = createNote(dir, { type: "note", title: "cache RULES", body: "second half of the fact", author });
+    const { newNote, sources } = consolidateNotes(dir, [a.id, b.id], {
+      type: "convention",
+      title: "Cache rules, consolidated",
+      body: "Both halves, in one place.",
+      author: { human: "diego", agent: "dream" },
+    });
+    assert.deepEqual(newNote.consolidates, [a.id, b.id]);
+    assert.deepEqual(sources.map((s) => s.superseded_by), [newNote.id, newNote.id]);
+    const rereadA = parseNoteFile(a.file, fs.readFileSync(a.file, "utf8")).note!;
+    assert.equal(rereadA.superseded_by, newNote.id, "the stamp must land on disk");
+    assert.equal(rereadA.body, "first half of the fact", "consolidation must never touch a source body");
+    const brain = loadBrain(dir);
+    assert.deepEqual(activeNotes(brain).map((n) => n.id), [newNote.id], "both sources must leave the active set");
+    assert.deepEqual(diagnose(dir), [], "a consolidates chain must validate clean, including the superseded_by back-check");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+check("consolidateNotes: validate-first refusals stamp nothing", () => {
+  const dir = tmpdir("brain-consolidate2-");
+  try {
+    const author = { human: "d", agent: null };
+    const a = createNote(dir, { type: "note", title: "Alpha", body: "x", author });
+    const b = createNote(dir, { type: "note", title: "Beta", body: "y", author });
+    assert.throws(() => consolidateNotes(dir, [a.id, "01J8NOPE00000000000000NOPE"], { type: "note", title: "n", body: "b", author }), /nothing was consolidated/);
+    assert.equal(parseNoteFile(a.file, fs.readFileSync(a.file, "utf8")).note!.superseded_by, undefined, "the good source must be untouched");
+    assert.throws(() => consolidateNotes(dir, [a.id, a.id], { type: "note", title: "n", body: "b", author }), /distinct/);
+    assert.throws(() => consolidateNotes(dir, [], { type: "note", title: "n", body: "b", author }), /at least one/);
+    supersedeNote(dir, b.id, { type: "note", title: "Beta v2", body: "y2", author });
+    assert.throws(() => consolidateNotes(dir, [a.id, b.id], { type: "note", title: "n", body: "b", author }), /already superseded/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+check("diagnose: dangling and unstamped consolidates chains are reported", () => {
+  const dir = tmpdir("brain-doc-consolidate-");
+  try {
+    const author = { human: "d", agent: null };
+    const orphan = createNote(dir, { type: "note", title: "Unstamped source", body: "x", author });
+    fs.writeFileSync(
+      path.join(dir, "bad-merge.md"),
+      serializeNote({
+        id: "01J8D000000000000000000001",
+        type: "note",
+        title: "Bad merge",
+        author: { human: "d", agent: "dream" },
+        created: "2026-08-18T10:00:00.000Z",
+        supersedes: null,
+        consolidates: [orphan.id, "01J8B0000000000000000GHOST"],
+        credits: 0,
+        last_credited: null,
+        body: "claims to consolidate, but nobody was stamped",
+      }),
+    );
+    const messages = diagnose(dir).map((p) => p.message).join("\n");
+    assert.ok(/dangling consolidates: 01J8B0000000000000000GHOST/.test(messages), messages);
+    assert.ok(/consolidates chain mismatch/.test(messages), messages);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- M3: dream hygiene, digest, JSON guard ----
+
+/** Seed the three hygiene cases: a duplicate active title pair, a superseded-but-referenced link, a stale unproven note. */
+function seedHygieneBrain(dir: string): { dupA: Note; dupB: Note; oldRule: Note; stale: Note } {
+  const author = { human: "diego", agent: null };
+  const at = (daysOld: number) => {
+    const created = daysAgo(daysOld);
+    return { created, id: ulid(Date.parse(created)) };
+  };
+  const dupA = createNote(dir, { type: "note", title: "Cache rules", body: "pnpm cache lives in .pnpm-cache", author, ...at(30) });
+  const dupB = createNote(dir, { type: "note", title: "cache rules", body: "clear the cache when lockfiles change", author, ...at(20) });
+  const oldRule = createNote(dir, { type: "decision", title: "Old deploy rule", body: "deploy Fridays", author, ...at(15) });
+  supersedeNote(dir, oldRule.id, { type: "decision", title: "New deploy rule", body: "never deploy Fridays", author, ...at(10) });
+  createNote(dir, { type: "note", title: "Release checklist", body: "follow [[Old deploy rule]] before shipping", author, ...at(5) });
+  const stale = createNote(dir, { type: "note", title: "Maybe flaky endpoint", body: "the status endpoint might lie", author: { human: "diego", agent: "codex" }, ...at(120) });
+  return { dupA, dupB, oldRule, stale };
+}
+
+check("dream hygiene: detects duplicate titles, superseded-but-referenced links, and stale unproven notes", () => {
+  const dir = tmpdir("brain-hygiene-");
+  try {
+    const { dupA, dupB, oldRule, stale } = seedHygieneBrain(dir);
+    const h = hygieneFindings(loadBrain(dir), NOW);
+    assert.equal(h.duplicateTitles.length, 1);
+    assert.deepEqual(h.duplicateTitles[0].ids.sort(), [dupA.id, dupB.id].sort());
+    assert.equal(h.supersededReferenced.length, 1);
+    assert.equal(h.supersededReferenced[0].link, "Old deploy rule");
+    assert.deepEqual(h.supersededReferenced[0].supersededIds, [oldRule.id]);
+    assert.deepEqual(h.staleUnproven.map((s) => s.id), [stale.id], "a 120 day old uncredited bare-agent note is stale unproven");
+    assert.ok(h.staleUnproven[0].ageDays >= 119, "age must be reported in days");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+check("dream digest: deterministic, sorted by id, excerpts capped at 280 flattened chars", () => {
+  const dir = tmpdir("brain-digest-");
+  try {
+    const author = { human: "diego", agent: null };
+    createNote(dir, { type: "note", title: "Long note", body: ("many words here\n".repeat(50)), author, created: daysAgo(2), id: ulid(Date.parse(daysAgo(2))) });
+    createNote(dir, { type: "gotcha", title: "Short note", body: "brief", author, created: daysAgo(1), id: ulid(Date.parse(daysAgo(1))) });
+    const one = buildDigest(loadBrain(dir), NOW);
+    const two = buildDigest(loadBrain(dir), NOW);
+    assert.equal(one.text, two.text, "same brain and clock must produce byte-identical digests");
+    assert.deepEqual(one.entries.map((e) => e.id), [...one.entries.map((e) => e.id)].sort(), "entries must sort by id");
+    const long = one.entries.find((e) => e.title === "Long note")!;
+    assert.equal(long.excerpt.length, 280);
+    assert.ok(!long.excerpt.includes("\n"), "excerpts must flatten newlines");
+    const short = one.entries.find((e) => e.title === "Short note")!;
+    assert.equal(short.age_days, 1);
+    assert.equal(short.credits, 0);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+check("dream extractJson: tolerates prose and fences, refuses garbage", () => {
+  assert.deepEqual(extractJson('Here you go:\n```json\n{"proposals": []}\n```\nDone.'), { proposals: [] });
+  assert.deepEqual(extractJson('{"verdicts":[{"index":0,"verdict":"keep","reason":"r"}]}'), {
+    verdicts: [{ index: 0, verdict: "keep", reason: "r" }],
+  });
+  assert.equal(extractJson("I dreamt of ponies and cannot answer."), null);
+  assert.equal(extractJson("almost json { proposals: [ oops"), null);
+});
+
+// ---- M3: dream CLI end-to-end over a fake claude shim on PATH ----
+
+/**
+ * The fake `claude` binary. Hermetic: never touches the network or the real
+ * CLI. It tells proposer from refuter calls by the prompt text on stdin, and
+ * its behavior is driven by FAKE_CLAUDE_MODE plus FAKE_* seed ids, mirroring
+ * the shim-on-PATH pattern the MCP tests use for child processes.
+ */
+const SHIM_SOURCE = `#!/usr/bin/env node
+const fs = require("fs");
+const input = fs.readFileSync(0, "utf8");
+const mode = process.env.FAKE_CLAUDE_MODE || "wellformed";
+const isRefuter = input.includes("You are the REFUTER");
+if (process.env.FAKE_CLAUDE_LOG) {
+  fs.appendFileSync(
+    process.env.FAKE_CLAUDE_LOG,
+    JSON.stringify({ role: isRefuter ? "refuter" : "proposer", args: process.argv.slice(2), maxTokens: process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS || null }) + "\\n",
+  );
+}
+const out = (s) => process.stdout.write(s);
+if (!isRefuter) {
+  if (mode === "proposer-garbage") { out("I dreamt of electric sheep and cannot answer in JSON."); process.exit(0); }
+  const proposals = [];
+  if (process.env.FAKE_MERGE_IDS) {
+    proposals.push({ op: "merge", source_ids: process.env.FAKE_MERGE_IDS.split(","), type: "convention", title: "Cache rules, consolidated", body: "The pnpm cache lives in .pnpm-cache; clear it when lockfiles change.", rationale: "Both notes state halves of the same cache fact." });
+  }
+  if (process.env.FAKE_PROMOTE_ID) {
+    proposals.push({ op: "promote", source_id: process.env.FAKE_PROMOTE_ID, title: "Always pin node versions", body: "Pin node in .nvmrc; unpinned builds broke twice.", rationale: "Twice-credited gotcha; promote to convention." });
+  }
+  if (process.env.FAKE_CONTRA_IDS) {
+    proposals.push({ op: "flag_contradiction", ids: process.env.FAKE_CONTRA_IDS.split(","), reason: "One note says deploy on Fridays, the other forbids it.", rationale: "Both cannot hold at once." });
+  }
+  if (process.env.FAKE_RETITLE_ID) {
+    proposals.push({ op: "retitle_for_collision", id: process.env.FAKE_RETITLE_ID, new_title: "Cache paths (pnpm)", rationale: "Title collides with another active note." });
+  }
+  if (process.env.FAKE_BOGUS_PROPOSAL === "1") proposals.push({ op: "delete_everything", id: "nope" });
+  out("Here is the dream:\\n\`\`\`json\\n" + JSON.stringify({ proposals }) + "\\n\`\`\`\\n");
+  process.exit(0);
+}
+if (mode === "refuter-garbage") { out("As a reviewer I feel conflicted and will write a poem instead."); process.exit(0); }
+const indexes = [...input.matchAll(/^PROPOSAL (\\d+):/gm)].map((m) => Number(m[1]));
+let verdicts;
+if (mode === "refuter-rejects-some") {
+  verdicts = indexes
+    .map((i) => {
+      if (i === 0) return { index: 0, verdict: "keep", reason: "Sources agree; the merge loses nothing." };
+      if (i === 1) return { index: 1, verdict: "reject", reason: "The draft drops the second incident's detail." };
+      if (i === 2) return null;
+      return { index: i, verdict: "maybe", reason: "unsure" };
+    })
+    .filter(Boolean);
+} else {
+  verdicts = indexes.map((i) => ({ index: i, verdict: "keep", reason: "Checked against the source notes; nothing is lost." }));
+}
+out(JSON.stringify({ verdicts }) + "\\n");
+`;
+
+const shimDir = tmpdir("brain-shim-");
+fs.writeFileSync(path.join(shimDir, "claude"), SHIM_SOURCE, { mode: 0o755 });
+const SHIM_PATH = `${shimDir}${path.delimiter}${process.env.PATH ?? ""}`;
+/** A PATH with no `claude` anywhere, for the missing-binary and dry-digest tests. */
+const NO_CLAUDE_PATH = "/usr/bin:/bin";
+
+function dreamEnv(extra: Record<string, string> = {}): Record<string, string> {
+  return { PATH: SHIM_PATH, BRAIN_HUMAN: "dreamtester", ...extra };
+}
+
+function findDreamReport(dir: string): string {
+  const dreams = path.join(dir, "dreams");
+  const files = fs.existsSync(dreams) ? fs.readdirSync(dreams).filter((f) => f.startsWith("DREAM_")) : [];
+  assert.equal(files.length, 1, `expected exactly one dream report, found: ${files.join(", ")}`);
+  return fs.readFileSync(path.join(dreams, files[0]), "utf8");
+}
+
+/** Two active notes with colliding titles, ready to be merged. */
+function seedMergePair(dir: string): { a: Note; b: Note } {
+  const author = { human: "diego", agent: null };
+  const a = createNote(dir, { type: "note", title: "Cache rules", body: "pnpm cache lives in .pnpm-cache", author, created: daysAgo(3), id: ulid(Date.parse(daysAgo(3))) });
+  const b = createNote(dir, { type: "note", title: "cache rules", body: "clear the cache when lockfiles change", author, created: daysAgo(2), id: ulid(Date.parse(daysAgo(2))) });
+  return { a, b };
+}
+
+check("cli dream --dry-digest: prints the exact proposer prompt and makes no model calls (no claude needed)", () => {
+  const dir = tmpdir("brain-dream-dry-");
+  try {
+    const { a } = seedMergePair(dir);
+    const r = runCli(["dream", "--dry-digest", "--dir", dir], { env: { PATH: NO_CLAUDE_PATH } });
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(r.stdout.includes("You are the PROPOSER"), "must print the real proposer prompt");
+    assert.ok(r.stdout.includes(a.id), "the digest must carry the note ids");
+    assert.ok(r.stdout.includes("HYGIENE FINDINGS"), "the prompt must carry the hygiene seed section");
+    assert.ok(r.stdout.includes('duplicate active title "Cache rules"'), r.stdout);
+    assert.ok(!fs.existsSync(path.join(dir, "dreams")), "a dry run must not write a report");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+check("cli dream: missing claude binary fails with a friendly requirement message, never asks for API keys", () => {
+  const dir = tmpdir("brain-dream-nobin-");
+  try {
+    seedMergePair(dir);
+    const r = runCli(["dream", "--dir", dir], { env: { PATH: NO_CLAUDE_PATH } });
+    assert.equal(r.status, 2, `expected exit 2, got ${r.status}: ${r.stdout}`);
+    assert.ok(r.stderr.includes("Claude Code CLI"), r.stderr);
+    assert.ok(r.stderr.includes("never reads or requires API keys"), r.stderr);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+check("cli dream report-only: full report with refuter: ran, and NOTHING applied", () => {
+  const dir = tmpdir("brain-dream-report-");
+  try {
+    const { a, b } = seedMergePair(dir);
+    const r = runCli(["dream", "--dir", dir], { env: dreamEnv({ FAKE_MERGE_IDS: `${a.id},${b.id}` }) });
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(r.stdout.includes("refuter: ran"), r.stdout);
+    assert.ok(r.stdout.includes("report-only run"), r.stdout);
+    const report = findDreamReport(dir);
+    for (const section of ["# Dream report", "## Inputs digest", "## Hygiene findings", "## Proposals", "## Refuter review", "## Applied", "## Undo"]) {
+      assert.ok(report.includes(section), `report must carry section: ${section}`);
+    }
+    assert.ok(report.includes("refuter: ran"), "the mandatory refuter line must be present");
+    assert.ok(!report.includes("refuter: absent"), "a reviewed dream must not read as unreviewed");
+    assert.ok(report.includes("proposal 0: keep"), report);
+    assert.ok(report.includes("report-only run: nothing was applied"), report);
+    assert.ok(report.includes("git revert"), "the report must say how to undo");
+    const brain = loadBrain(dir);
+    assert.equal(brain.notes.length, 2, "report-only must write no notes");
+    assert.ok(brain.notes.every((n) => n.superseded_by === undefined), "report-only must stamp nothing");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+check("cli dream --apply: merge writes consolidates, stamps superseded_by on both sources, doctor stays clean", () => {
+  const dir = tmpdir("brain-dream-apply-");
+  try {
+    const { a, b } = seedMergePair(dir);
+    const r = runCli(["dream", "--apply", "--dir", dir], { env: dreamEnv({ FAKE_MERGE_IDS: `${a.id},${b.id}` }) });
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(r.stdout.includes("applied: 1 change(s)"), r.stdout);
+    const brain = loadBrain(dir);
+    const merged = brain.notes.find((n) => n.consolidates !== undefined)!;
+    assert.ok(merged, "the merged note must exist");
+    assert.deepEqual(merged.consolidates, [a.id, b.id]);
+    assert.deepEqual(merged.author, { human: "dreamtester", agent: "dream" }, "dream notes are authored by the brain owner via the dream agent");
+    assert.equal(brain.byId.get(a.id)!.superseded_by, merged.id);
+    assert.equal(brain.byId.get(b.id)!.superseded_by, merged.id);
+    assert.deepEqual(activeNotes(brain).map((n) => n.id), [merged.id]);
+    assert.deepEqual(diagnose(dir), [], "an applied dream must leave the brain valid");
+    assert.ok(findDreamReport(dir).includes("merged 2 notes"), "the report must record the application");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+check("cli dream: refuter garbage means refuter: absent and ZERO applications, even with --apply", () => {
+  const dir = tmpdir("brain-dream-garbage-");
+  try {
+    const { a, b } = seedMergePair(dir);
+    const before = fs.readdirSync(dir).sort();
+    const r = runCli(["dream", "--apply", "--dir", dir], {
+      env: dreamEnv({ FAKE_MERGE_IDS: `${a.id},${b.id}`, FAKE_CLAUDE_MODE: "refuter-garbage" }),
+    });
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(r.stdout.includes("refuter: absent"), r.stdout);
+    assert.ok(r.stdout.includes("applied: nothing"), r.stdout);
+    const report = findDreamReport(dir);
+    assert.ok(report.includes("refuter: absent"), "the mandatory line must say the reviewer never showed");
+    assert.ok(!report.includes("refuter: ran"), "an unreviewed dream must never read as reviewed");
+    assert.ok(report.includes("unreviewed dreams are never applied"), report);
+    assert.deepEqual(fs.readdirSync(dir).sort().filter((f) => f !== "dreams"), before, "no note files may change");
+    assert.ok(loadBrain(dir).notes.every((n) => n.superseded_by === undefined), "nothing may be stamped");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+check("cli dream: proposer garbage is a graceful empty dream with an honest report", () => {
+  const dir = tmpdir("brain-dream-pgarbage-");
+  try {
+    seedMergePair(dir);
+    const r = runCli(["dream", "--apply", "--dir", dir], { env: dreamEnv({ FAKE_CLAUDE_MODE: "proposer-garbage" }) });
+    assert.equal(r.status, 0, r.stderr);
+    const report = findDreamReport(dir);
+    assert.ok(report.includes("empty dream"), report);
+    assert.ok(report.includes("refuter: absent"), "with nothing to review the refuter is honestly reported absent");
+    assert.ok(report.includes("not consulted"), "the report must distinguish not-consulted from failed");
+    assert.equal(loadBrain(dir).notes.length, 2, "an empty dream writes nothing");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+check("cli dream --apply: refuter rejections and missing verdicts (default reject) gate what is applied", () => {
+  const dir = tmpdir("brain-dream-rejects-");
+  try {
+    const author = { human: "diego", agent: null };
+    const { a, b } = seedMergePair(dir);
+    const gotcha = createNote(dir, { type: "gotcha", title: "Unpinned node broke the build", body: "It broke twice.", author: { human: "diego", agent: "codex" } });
+    creditNotes(dir, [gotcha.id]);
+    creditNotes(dir, [gotcha.id]);
+    const c1 = createNote(dir, { type: "decision", title: "Deploy on Fridays", body: "ship it", author });
+    const c2 = createNote(dir, { type: "decision", title: "Never deploy on Fridays", body: "outage settled it", author });
+    const retitleTarget = createNote(dir, { type: "note", title: "Cache paths", body: "where caches live", author });
+    const r = runCli(["dream", "--apply", "--dir", dir], {
+      env: dreamEnv({
+        FAKE_CLAUDE_MODE: "refuter-rejects-some",
+        FAKE_MERGE_IDS: `${a.id},${b.id}`,
+        FAKE_PROMOTE_ID: gotcha.id,
+        FAKE_CONTRA_IDS: `${c1.id},${c2.id}`,
+        FAKE_RETITLE_ID: retitleTarget.id,
+      }),
+    });
+    assert.equal(r.status, 0, r.stderr);
+    const report = findDreamReport(dir);
+    assert.ok(report.includes("refuter: ran"), report);
+    assert.ok(report.includes("proposal 0: keep"), report);
+    assert.ok(report.includes("proposal 1: reject"), report);
+    assert.ok(report.includes("rejected by default"), "a missing verdict must be reported as a default reject");
+    assert.ok(report.includes("(defaulted)"), report);
+    const brain = loadBrain(dir);
+    assert.ok(brain.notes.some((n) => n.consolidates !== undefined), "the kept merge must be applied");
+    assert.equal(brain.byId.get(gotcha.id)!.superseded_by, undefined, "the rejected promotion must not be applied");
+    assert.ok(!brain.notes.some((n) => n.type === "open_thread"), "the default-rejected contradiction must not be filed");
+    assert.equal(brain.byId.get(retitleTarget.id)!.superseded_by, undefined, "the default-rejected retitle must not be applied");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+check("cli dream --apply: contradiction files an open_thread authored by dream, capped as a bare agent claim", () => {
+  const dir = tmpdir("brain-dream-contra-");
+  try {
+    const author = { human: "diego", agent: null };
+    const c1 = createNote(dir, { type: "decision", title: "Deploy on Fridays", body: "ship it", author });
+    const c2 = createNote(dir, { type: "decision", title: "Never deploy on Fridays", body: "outage settled it", author });
+    const r = runCli(["dream", "--apply", "--dir", dir], { env: dreamEnv({ FAKE_CONTRA_IDS: `${c1.id},${c2.id}` }) });
+    assert.equal(r.status, 0, r.stderr);
+    const brain = loadBrain(dir);
+    const thread = brain.notes.find((n) => n.type === "open_thread")!;
+    assert.ok(thread, "the contradiction must be filed as an open_thread note");
+    assert.ok(thread.title.startsWith("Contradiction:"), thread.title);
+    assert.deepEqual(thread.author, { human: "dreamtester", agent: "dream" });
+    assert.equal(capFor(thread), 0.6, "dream output is a bare agent claim: it starts at low trust by design");
+    assert.equal(tierFor(confidenceFor(thread), thread.credits), "verify");
+    assert.ok(thread.body.includes(c1.id) && thread.body.includes(c2.id), "the thread must name both notes");
+    assert.equal(brain.byId.get(c1.id)!.superseded_by, undefined, "flagging must not supersede either side");
+    assert.deepEqual(diagnose(dir), [], "the filed thread's wikilinks must resolve");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+check("cli dream --apply is undoable: only new files plus superseded_by stamps, bodies never touched", () => {
+  const dir = tmpdir("brain-dream-undo-");
+  try {
+    const author = { human: "diego", agent: null };
+    const { a, b } = seedMergePair(dir);
+    const gotcha = createNote(dir, { type: "gotcha", title: "Unpinned node broke the build", body: "It broke twice.", author: { human: "diego", agent: "codex" } });
+    creditNotes(dir, [gotcha.id]);
+    creditNotes(dir, [gotcha.id]);
+    const retitleTarget = createNote(dir, { type: "note", title: "Cache paths", body: "where caches live", author });
+    const before = new Map<string, Note>();
+    for (const n of loadBrain(dir).notes) before.set(n.file, n);
+    const r = runCli(["dream", "--apply", "--dir", dir], {
+      env: dreamEnv({ FAKE_MERGE_IDS: `${a.id},${b.id}`, FAKE_PROMOTE_ID: gotcha.id, FAKE_RETITLE_ID: retitleTarget.id }),
+    });
+    assert.equal(r.status, 0, r.stderr);
+    const after = loadBrain(dir);
+    for (const [file, old] of before) {
+      const now = after.notes.find((n) => n.file === file)!;
+      assert.ok(now, `preexisting file must survive: ${file}`);
+      const { superseded_by: _s1, file: _f1, ...oldRest } = old;
+      const { superseded_by: _s2, file: _f2, ...nowRest } = now;
+      assert.deepEqual(nowRest, oldRest, `only superseded_by may change on ${path.basename(file)}`);
+    }
+    assert.ok(after.notes.length > before.size, "applications must arrive as new files");
+    assert.deepEqual(diagnose(dir), []);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+check("cli dream: --model reaches claude -p, and the proposer/refuter token ceilings are 8000/4000", () => {
+  const dir = tmpdir("brain-dream-model-");
+  try {
+    const { a, b } = seedMergePair(dir);
+    const log = path.join(dir, "..", `fake-claude-log-${path.basename(dir)}.jsonl`);
+    const r = runCli(["dream", "--model", "claude-test-model", "--dir", dir], {
+      env: dreamEnv({ FAKE_MERGE_IDS: `${a.id},${b.id}`, FAKE_CLAUDE_LOG: log }),
+    });
+    assert.equal(r.status, 0, r.stderr);
+    const calls = fs.readFileSync(log, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    fs.rmSync(log, { force: true });
+    assert.deepEqual(calls.map((c) => c.role), ["proposer", "refuter"], "exactly two calls: propose, then refute");
+    for (const c of calls) {
+      assert.deepEqual(c.args, ["-p", "--model", "claude-test-model"], "the model id must ride claude -p --model");
+    }
+    assert.equal(calls[0].maxTokens, "8000", "proposer output ceiling");
+    assert.equal(calls[1].maxTokens, "4000", "refuter output ceiling");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+fs.rmSync(shimDir, { recursive: true, force: true });
 
 if (failures > 0) {
   console.error(`\n${failures} test(s) FAILED`);
